@@ -45,6 +45,9 @@ python scripts/run_ablation.py --dataset demo --device cpu --max_epochs 10 --n_r
 
 # Run hyperparameter sensitivity on demo
 python scripts/run_hyperparam.py --dataset demo --device cpu --max_epochs 10 --n_runs 1 --batch_size 256
+
+# Run backbone transferability on demo
+python scripts/run_transfer.py --dataset demo --device cpu --max_epochs 10 --n_runs 1 --batch_size 256
 ```
 
 ## Running Experiments
@@ -74,4 +77,7 @@ python scripts/run_ablation.py --dataset baby --device cuda
 
 # Hyperparameter sensitivity
 python scripts/run_hyperparam.py --dataset baby --device cuda
+
+# Backbone transferability (Intra-MDM / Inter-MDM on other backbones)
+python scripts/run_transfer.py --dataset baby --device cuda
 ```
