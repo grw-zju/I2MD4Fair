@@ -1,7 +1,5 @@
 # I2MD4Fair: Intra- and Inter-Modality Debiasing for Item-Side Exposure Fairness in Multimodal Recommendation
 
-Official implementation of **I2MD4Fair** (TOIS 2026).
-
 ## Installation
 
 ```bash
