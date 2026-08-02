@@ -17,6 +17,7 @@ from baseline import (
     LGMRec, BM3, SLMRec, MMSSL, DiffMM, MENTOR,
     DMRL, CLUSSL, ModalityDebiasingWrapper, DPRWrapper, FairDualWrapper
 )
+from scripts.run_transfer import BackboneWithDebias
 
 MODEL_REGISTRY = {
     'I2MD4Fair': I2MD4Fair,
@@ -46,6 +47,18 @@ MODEL_REGISTRY = {
     'DiffMM+FairDual': DiffMM,
     'LGMRec+FairDual': LGMRec,
     'MENTOR+FairDual': MENTOR,
+    'MMSSL+Intra': MMSSL,
+    'DiffMM+Intra': DiffMM,
+    'LGMRec+Intra': LGMRec,
+    'MENTOR+Intra': MENTOR,
+    'MMSSL+Inter': MMSSL,
+    'DiffMM+Inter': DiffMM,
+    'LGMRec+Inter': LGMRec,
+    'MENTOR+Inter': MENTOR,
+    'MMSSL+Intra+Inter': MMSSL,
+    'DiffMM+Intra+Inter': DiffMM,
+    'LGMRec+Intra+Inter': LGMRec,
+    'MENTOR+Intra+Inter': MENTOR,
 }
 
 GRAPH_ONLY_MODELS = {'LightGCN'}
@@ -55,11 +68,17 @@ GRAPH_MODALITY_MODELS = {'MMGCN', 'GRCN', 'LATTICE', 'FREEDOM', 'LGMRec',
                          'DMRL', 'CLUSSL',
                          'MMSSL+MD', 'DiffMM+MD', 'LGMRec+MD', 'MENTOR+MD',
                          'MMSSL+DPR', 'DiffMM+DPR', 'LGMRec+DPR', 'MENTOR+DPR',
-                         'MMSSL+FairDual', 'DiffMM+FairDual', 'LGMRec+FairDual', 'MENTOR+FairDual'}
+                         'MMSSL+FairDual', 'DiffMM+FairDual', 'LGMRec+FairDual', 'MENTOR+FairDual',
+                         'MMSSL+Intra', 'DiffMM+Intra', 'LGMRec+Intra', 'MENTOR+Intra',
+                         'MMSSL+Inter', 'DiffMM+Inter', 'LGMRec+Inter', 'MENTOR+Inter',
+                         'MMSSL+Intra+Inter', 'DiffMM+Intra+Inter', 'LGMRec+Intra+Inter', 'MENTOR+Intra+Inter'}
 I2MD4FAIR_MODELS = {'I2MD4Fair'}
 MD_MODELS = {'MMSSL+MD', 'DiffMM+MD', 'LGMRec+MD', 'MENTOR+MD'}
 DPR_MODELS = {'MMSSL+DPR', 'DiffMM+DPR', 'LGMRec+DPR', 'MENTOR+DPR'}
 FAIRDUAL_MODELS = {'MMSSL+FairDual', 'DiffMM+FairDual', 'LGMRec+FairDual', 'MENTOR+FairDual'}
+TRANSFER_MODELS = ({'MMSSL+Intra', 'DiffMM+Intra', 'LGMRec+Intra', 'MENTOR+Intra',
+                    'MMSSL+Inter', 'DiffMM+Inter', 'LGMRec+Inter', 'MENTOR+Inter',
+                    'MMSSL+Intra+Inter', 'DiffMM+Intra+Inter', 'LGMRec+Intra+Inter', 'MENTOR+Intra+Inter'})
 
 
 def build_model(model_name, dataset, args, device):
@@ -68,7 +87,11 @@ def build_model(model_name, dataset, args, device):
     embed_dim = args.embed_dim
     modality_dims = dataset.get_modality_features_dim()
 
-    base_model_name = model_name.replace('+MD', '').replace('+DPR', '').replace('+FairDual', '')
+    base_model_name = model_name
+    for suffix in ['+MD', '+DPR', '+FairDual', '+Intra+Inter', '+Intra', '+Inter']:
+        if model_name.endswith(suffix):
+            base_model_name = model_name[:-len(suffix)]
+            break
 
     if base_model_name == 'I2MD4Fair':
         model = I2MD4Fair(
@@ -119,6 +142,16 @@ def build_model(model_name, dataset, args, device):
     if model_name in FAIRDUAL_MODELS:
         model = FairDualWrapper(model, n_users, n_items, embed_dim, modality_dims)
 
+    if model_name in TRANSFER_MODELS:
+        use_intra = '+Intra' in model_name
+        use_inter = '+Inter' in model_name
+        model = BackboneWithDebias(
+            model, modality_dims, embed_dim,
+            use_intra=use_intra, use_inter=use_inter,
+            n_protos=args.n_protos, eps=args.eps, p=args.p_norm,
+            lam=args.lam, tau=args.tau
+        )
+
     target = model.base_model if hasattr(model, 'base_model') else model
     if hasattr(target, 'set_precomputed_adj'):
         target.set_precomputed_adj(dataset.get_adj_matrices())
@@ -127,22 +160,31 @@ def build_model(model_name, dataset, args, device):
 
 
 def get_main_params(model, model_name):
-    if model_name not in I2MD4FAIR_MODELS:
+    if model_name not in I2MD4FAIR_MODELS and model_name not in TRANSFER_MODELS:
         return list(model.parameters())
     club_params = set()
-    for k in model.inter_mdm.club_estimators:
-        for p in model.inter_mdm.club_estimators[k].parameters():
-            club_params.add(p)
+    if hasattr(model, 'inter_mdm') and hasattr(model.inter_mdm, 'club_estimators'):
+        for k in model.inter_mdm.club_estimators:
+            for p in model.inter_mdm.club_estimators[k].parameters():
+                club_params.add(p)
+    if hasattr(model, 'club_estimators'):
+        for k in model.club_estimators:
+            for p in model.club_estimators[k].parameters():
+                club_params.add(p)
     main_params = [p for p in model.parameters() if p not in club_params]
     return main_params
 
 
 def get_club_params(model, model_name):
-    if model_name not in I2MD4FAIR_MODELS:
+    if model_name not in I2MD4FAIR_MODELS and model_name not in TRANSFER_MODELS:
         return []
     club_params = []
-    for k in model.inter_mdm.club_estimators:
-        club_params.extend(list(model.inter_mdm.club_estimators[k].parameters()))
+    if hasattr(model, 'inter_mdm') and hasattr(model.inter_mdm, 'club_estimators'):
+        for k in model.inter_mdm.club_estimators:
+            club_params.extend(list(model.inter_mdm.club_estimators[k].parameters()))
+    if hasattr(model, 'club_estimators'):
+        for k in model.club_estimators:
+            club_params.extend(list(model.club_estimators[k].parameters()))
     return club_params
 
 
@@ -167,6 +209,10 @@ def train_one_epoch(model, dataset, data_loader, graph_norm, modality_features,
                                  interaction_matrix_norm_u=inter_norm_u,
                                  interaction_matrix_norm_v=inter_norm_v,
                                  warmup=is_warmup)
+        elif model_name in TRANSFER_MODELS:
+            loss = model.compute_loss(user_ids, pos_ids, neg_ids, graph_norm, modality_features,
+                                      inter_norm_u=inter_norm_u, inter_norm_v=inter_norm_v,
+                                      warmup=is_warmup)
         elif model_name in MODALITY_ONLY_MODELS:
             loss = model.compute_loss(user_ids, pos_ids, neg_ids, modality_features)
         elif model_name in GRAPH_ONLY_MODELS:
@@ -183,7 +229,7 @@ def train_one_epoch(model, dataset, data_loader, graph_norm, modality_features,
         total_loss += loss.item()
         n_batches += 1
 
-        if model_name in I2MD4FAIR_MODELS and club_optimizer is not None:
+        if (model_name in I2MD4FAIR_MODELS or model_name in TRANSFER_MODELS) and club_optimizer is not None:
             club_optimizer.zero_grad()
             club_nll = model.club_nll_loss(modality_features, batch_item_ids)
             club_nll.backward()
@@ -308,7 +354,10 @@ if __name__ == '__main__':
                                  'MMSSL', 'DiffMM', 'MENTOR', 'DMRL', 'CLUSSL',
                                  'MMSSL+MD', 'DiffMM+MD', 'LGMRec+MD', 'MENTOR+MD',
                                  'MMSSL+DPR', 'DiffMM+DPR', 'LGMRec+DPR', 'MENTOR+DPR',
-                                 'MMSSL+FairDual', 'DiffMM+FairDual', 'LGMRec+FairDual', 'MENTOR+FairDual'])
+                                 'MMSSL+FairDual', 'DiffMM+FairDual', 'LGMRec+FairDual', 'MENTOR+FairDual',
+                                 'MMSSL+Intra', 'DiffMM+Intra', 'LGMRec+Intra', 'MENTOR+Intra',
+                                 'MMSSL+Inter', 'DiffMM+Inter', 'LGMRec+Inter', 'MENTOR+Inter',
+                                 'MMSSL+Intra+Inter', 'DiffMM+Intra+Inter', 'LGMRec+Intra+Inter', 'MENTOR+Intra+Inter'])
     parser.add_argument('--data_dir', type=str, default='data/damrs/')
     parser.add_argument('--embed_dim', type=int, default=64)
     parser.add_argument('--lr', type=float, default=0.001)

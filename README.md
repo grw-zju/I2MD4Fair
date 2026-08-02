@@ -67,7 +67,7 @@ python scripts/run_main.py --dataset baby --model MMSSL+FairDual --device cuda
 # ... (see all available models below)
 ```
 
-Available models: `I2MD4Fair`, `LightGCN`, `VBPR`, `MMGCN`, `GRCN`, `LATTICE`, `FREEDOM`, `LGMRec`, `BM3`, `SLMRec`, `MMSSL`, `DiffMM`, `MENTOR`, `DMRL`, `CLUSSL`, `MMSSL+MD`, `DiffMM+MD`, `LGMRec+MD`, `MENTOR+MD`, `MMSSL+DPR`, `DiffMM+DPR`, `LGMRec+DPR`, `MENTOR+DPR`, `MMSSL+FairDual`, `DiffMM+FairDual`, `LGMRec+FairDual`, `MENTOR+FairDual`
+Available models: `I2MD4Fair`, `LightGCN`, `VBPR`, `MMGCN`, `GRCN`, `LATTICE`, `FREEDOM`, `LGMRec`, `BM3`, `SLMRec`, `MMSSL`, `DiffMM`, `MENTOR`, `DMRL`, `CLUSSL`, `MMSSL+MD`, `DiffMM+MD`, `LGMRec+MD`, `MENTOR+MD`, `MMSSL+DPR`, `DiffMM+DPR`, `LGMRec+DPR`, `MENTOR+DPR`, `MMSSL+FairDual`, `DiffMM+FairDual`, `LGMRec+FairDual`, `MENTOR+FairDual`, `MMSSL+Intra`, `DiffMM+Intra`, `LGMRec+Intra`, `MENTOR+Intra`, `MMSSL+Inter`, `DiffMM+Inter`, `LGMRec+Inter`, `MENTOR+Inter`, `MMSSL+Intra+Inter`, `DiffMM+Intra+Inter`, `LGMRec+Intra+Inter`, `MENTOR+Intra+Inter`
 
 ### Ablation and hyperparameter studies
 
