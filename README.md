@@ -77,13 +77,3 @@ python scripts/run_ablation.py --dataset baby --device cuda
 # Hyperparameter sensitivity
 python scripts/run_hyperparam.py --dataset baby --device cuda
 ```
-
-### Output
-
-Each run prints averaged metrics over `n_runs`:
-
-```text
-N@10 N@20 R@10 R@20 HR@10 HR@20 G@10 G@20 E@10 E@20 C@10 C@20 REG@10 REG@20
-```
-
-`N` = NDCG, `R` = Recall, `HR` = Hit Rate, `G` = Gini (lower is better), `E` = Entropy (higher is better), `C` = Coverage (higher is better), `REG` = Relevance-aware Exposure Gap (lower is better).
