@@ -14,7 +14,8 @@ from utils.metrics import evaluate_model
 from models.i2md4fair import I2MD4Fair
 from baseline import (
     LightGCN, VBPR, MMGCN, GRCN, LATTICE, FREEDOM,
-    LGMRec, BM3, SLMRec, MMSSL, DiffMM, MENTOR, ModalityDebiasingWrapper
+    LGMRec, BM3, SLMRec, MMSSL, DiffMM, MENTOR,
+    DMRL, CLUSSL, ModalityDebiasingWrapper, DPRWrapper, FairDualWrapper
 )
 
 MODEL_REGISTRY = {
@@ -31,19 +32,34 @@ MODEL_REGISTRY = {
     'MMSSL': MMSSL,
     'DiffMM': DiffMM,
     'MENTOR': MENTOR,
+    'DMRL': DMRL,
+    'CLUSSL': CLUSSL,
     'MMSSL+MD': MMSSL,
     'DiffMM+MD': DiffMM,
     'LGMRec+MD': LGMRec,
     'MENTOR+MD': MENTOR,
+    'MMSSL+DPR': MMSSL,
+    'DiffMM+DPR': DiffMM,
+    'LGMRec+DPR': LGMRec,
+    'MENTOR+DPR': MENTOR,
+    'MMSSL+FairDual': MMSSL,
+    'DiffMM+FairDual': DiffMM,
+    'LGMRec+FairDual': LGMRec,
+    'MENTOR+FairDual': MENTOR,
 }
 
 GRAPH_ONLY_MODELS = {'LightGCN'}
 MODALITY_ONLY_MODELS = {'VBPR'}
 GRAPH_MODALITY_MODELS = {'MMGCN', 'GRCN', 'LATTICE', 'FREEDOM', 'LGMRec',
                          'BM3', 'SLMRec', 'MMSSL', 'DiffMM', 'MENTOR',
-                         'MMSSL+MD', 'DiffMM+MD', 'LGMRec+MD', 'MENTOR+MD'}
+                         'DMRL', 'CLUSSL',
+                         'MMSSL+MD', 'DiffMM+MD', 'LGMRec+MD', 'MENTOR+MD',
+                         'MMSSL+DPR', 'DiffMM+DPR', 'LGMRec+DPR', 'MENTOR+DPR',
+                         'MMSSL+FairDual', 'DiffMM+FairDual', 'LGMRec+FairDual', 'MENTOR+FairDual'}
 I2MD4FAIR_MODELS = {'I2MD4Fair'}
 MD_MODELS = {'MMSSL+MD', 'DiffMM+MD', 'LGMRec+MD', 'MENTOR+MD'}
+DPR_MODELS = {'MMSSL+DPR', 'DiffMM+DPR', 'LGMRec+DPR', 'MENTOR+DPR'}
+FAIRDUAL_MODELS = {'MMSSL+FairDual', 'DiffMM+FairDual', 'LGMRec+FairDual', 'MENTOR+FairDual'}
 
 
 def build_model(model_name, dataset, args, device):
@@ -52,7 +68,7 @@ def build_model(model_name, dataset, args, device):
     embed_dim = args.embed_dim
     modality_dims = dataset.get_modality_features_dim()
 
-    base_model_name = model_name.replace('+MD', '')
+    base_model_name = model_name.replace('+MD', '').replace('+DPR', '').replace('+FairDual', '')
 
     if base_model_name == 'I2MD4Fair':
         model = I2MD4Fair(
@@ -86,12 +102,22 @@ def build_model(model_name, dataset, args, device):
         model = DiffMM(n_users, n_items, embed_dim, modality_dims, n_layers=args.n_layers)
     elif base_model_name == 'MENTOR':
         model = MENTOR(n_users, n_items, embed_dim, modality_dims, n_layers=args.n_layers)
+    elif base_model_name == 'DMRL':
+        model = DMRL(n_users, n_items, embed_dim, modality_dims, n_layers=args.n_layers)
+    elif base_model_name == 'CLUSSL':
+        model = CLUSSL(n_users, n_items, embed_dim, modality_dims, n_layers=args.n_layers)
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
     if model_name in MD_MODELS:
         model = ModalityDebiasingWrapper(model, n_users, n_items, embed_dim, modality_dims,
                                          model_type=base_model_name.lower())
+
+    if model_name in DPR_MODELS:
+        model = DPRWrapper(model, n_users, n_items, embed_dim, modality_dims)
+
+    if model_name in FAIRDUAL_MODELS:
+        model = FairDualWrapper(model, n_users, n_items, embed_dim, modality_dims)
 
     target = model.base_model if hasattr(model, 'base_model') else model
     if hasattr(target, 'set_precomputed_adj'):
@@ -279,8 +305,10 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='LightGCN',
                         choices=['I2MD4Fair', 'LightGCN', 'VBPR', 'MMGCN', 'GRCN',
                                  'LATTICE', 'FREEDOM', 'LGMRec', 'BM3', 'SLMRec',
-                                 'MMSSL', 'DiffMM', 'MENTOR',
-                                 'MMSSL+MD', 'DiffMM+MD', 'LGMRec+MD', 'MENTOR+MD'])
+                                 'MMSSL', 'DiffMM', 'MENTOR', 'DMRL', 'CLUSSL',
+                                 'MMSSL+MD', 'DiffMM+MD', 'LGMRec+MD', 'MENTOR+MD',
+                                 'MMSSL+DPR', 'DiffMM+DPR', 'LGMRec+DPR', 'MENTOR+DPR',
+                                 'MMSSL+FairDual', 'DiffMM+FairDual', 'LGMRec+FairDual', 'MENTOR+FairDual'])
     parser.add_argument('--data_dir', type=str, default='data/damrs/')
     parser.add_argument('--embed_dim', type=int, default=64)
     parser.add_argument('--lr', type=float, default=0.001)
