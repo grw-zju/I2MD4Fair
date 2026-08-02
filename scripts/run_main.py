@@ -1,0 +1,299 @@
+import os
+import sys
+import argparse
+import torch
+import numpy as np
+import copy
+from collections import defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from data.dataset import DAMRSDataset
+from utils.data_utils import BPRDataLoader
+from utils.metrics import evaluate_model
+from models.i2md4fair import I2MD4Fair
+from baseline import (
+    LightGCN, VBPR, MMGCN, GRCN, LATTICE, FREEDOM,
+    LGMRec, BM3, SLMRec, MMSSL, DiffMM, MENTOR, ModalityDebiasingWrapper
+)
+
+MODEL_REGISTRY = {
+    'I2MD4Fair': I2MD4Fair,
+    'LightGCN': LightGCN,
+    'VBPR': VBPR,
+    'MMGCN': MMGCN,
+    'GRCN': GRCN,
+    'LATTICE': LATTICE,
+    'FREEDOM': FREEDOM,
+    'LGMRec': LGMRec,
+    'BM3': BM3,
+    'SLMRec': SLMRec,
+    'MMSSL': MMSSL,
+    'DiffMM': DiffMM,
+    'MENTOR': MENTOR,
+    'MMSSL+MD': MMSSL,
+    'DiffMM+MD': DiffMM,
+    'LGMRec+MD': LGMRec,
+    'MENTOR+MD': MENTOR,
+}
+
+GRAPH_ONLY_MODELS = {'LightGCN'}
+MODALITY_ONLY_MODELS = {'VBPR'}
+GRAPH_MODALITY_MODELS = {'MMGCN', 'GRCN', 'LATTICE', 'FREEDOM', 'LGMRec',
+                         'BM3', 'SLMRec', 'MMSSL', 'DiffMM', 'MENTOR',
+                         'MMSSL+MD', 'DiffMM+MD', 'LGMRec+MD', 'MENTOR+MD'}
+I2MD4FAIR_MODELS = {'I2MD4Fair'}
+MD_MODELS = {'MMSSL+MD', 'DiffMM+MD', 'LGMRec+MD', 'MENTOR+MD'}
+
+
+def build_model(model_name, dataset, args, device):
+    n_users = dataset.n_users
+    n_items = dataset.n_items
+    embed_dim = args.embed_dim
+    modality_dims = dataset.get_modality_features_dim()
+
+    base_model_name = model_name.replace('+MD', '')
+
+    if base_model_name == 'I2MD4Fair':
+        model = I2MD4Fair(
+            n_users=n_users, n_items=n_items, embed_dim=embed_dim,
+            modality_dims=modality_dims, n_protos=args.n_protos,
+            eps=args.eps, p=args.p_norm, lam=args.lam, tau=args.tau,
+            n_layers=args.n_layers, lambda1=args.lambda1,
+            lambda2=args.lambda2, lambda3=args.lambda3
+        )
+    elif base_model_name == 'LightGCN':
+        model = LightGCN(n_users, n_items, embed_dim, n_layers=args.n_layers)
+    elif base_model_name == 'VBPR':
+        model = VBPR(n_users, n_items, embed_dim, modality_dims['visual'])
+    elif base_model_name == 'MMGCN':
+        model = MMGCN(n_users, n_items, embed_dim, modality_dims, n_layers=args.n_layers)
+    elif base_model_name == 'GRCN':
+        model = GRCN(n_users, n_items, embed_dim, modality_dims, n_layers=args.n_layers)
+    elif base_model_name == 'LATTICE':
+        model = LATTICE(n_users, n_items, embed_dim, modality_dims, n_layers=args.n_layers)
+    elif base_model_name == 'FREEDOM':
+        model = FREEDOM(n_users, n_items, embed_dim, modality_dims, n_layers=args.n_layers)
+    elif base_model_name == 'LGMRec':
+        model = LGMRec(n_users, n_items, embed_dim, modality_dims, n_layers=args.n_layers)
+    elif base_model_name == 'BM3':
+        model = BM3(n_users, n_items, embed_dim, modality_dims, n_layers=args.n_layers)
+    elif base_model_name == 'SLMRec':
+        model = SLMRec(n_users, n_items, embed_dim, modality_dims, n_layers=args.n_layers)
+    elif base_model_name == 'MMSSL':
+        model = MMSSL(n_users, n_items, embed_dim, modality_dims, n_layers=args.n_layers)
+    elif base_model_name == 'DiffMM':
+        model = DiffMM(n_users, n_items, embed_dim, modality_dims, n_layers=args.n_layers)
+    elif base_model_name == 'MENTOR':
+        model = MENTOR(n_users, n_items, embed_dim, modality_dims, n_layers=args.n_layers)
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    if model_name in MD_MODELS:
+        model = ModalityDebiasingWrapper(model, n_users, n_items, embed_dim, modality_dims,
+                                         model_type=base_model_name.lower())
+
+    target = model.base_model if hasattr(model, 'base_model') else model
+    if hasattr(target, 'set_precomputed_adj'):
+        target.set_precomputed_adj(dataset.get_adj_matrices())
+
+    return model.to(device)
+
+
+def get_main_params(model, model_name):
+    if model_name not in I2MD4FAIR_MODELS:
+        return list(model.parameters())
+    club_params = set()
+    for k in model.inter_mdm.club_estimators:
+        for p in model.inter_mdm.club_estimators[k].parameters():
+            club_params.add(p)
+    main_params = [p for p in model.parameters() if p not in club_params]
+    return main_params
+
+
+def get_club_params(model, model_name):
+    if model_name not in I2MD4FAIR_MODELS:
+        return []
+    club_params = []
+    for k in model.inter_mdm.club_estimators:
+        club_params.extend(list(model.inter_mdm.club_estimators[k].parameters()))
+    return club_params
+
+
+def train_one_epoch(model, dataset, data_loader, graph_norm, modality_features,
+                    main_optimizer, club_optimizer, device, model_name,
+                    inter_norm_u=None, inter_norm_v=None):
+    model.train()
+    total_loss = 0
+    n_batches = 0
+
+    for _ in range(len(data_loader)):
+        user_ids, pos_ids, neg_ids = data_loader.get_batch()
+        user_ids = user_ids.to(device)
+        pos_ids = pos_ids.to(device)
+        neg_ids = neg_ids.to(device)
+
+        main_optimizer.zero_grad()
+
+        if model_name in I2MD4FAIR_MODELS:
+            loss, _, _, _ = model(graph_norm, modality_features, user_ids, pos_ids, neg_ids,
+                                 interaction_matrix_norm_u=inter_norm_u,
+                                 interaction_matrix_norm_v=inter_norm_v)
+        elif model_name in MODALITY_ONLY_MODELS:
+            loss = model.compute_loss(user_ids, pos_ids, neg_ids, modality_features)
+        elif model_name in GRAPH_ONLY_MODELS:
+            loss = model.compute_loss(user_ids, pos_ids, neg_ids, graph_norm)
+        elif model_name in GRAPH_MODALITY_MODELS:
+            loss = model.compute_loss(user_ids, pos_ids, neg_ids, graph_norm, modality_features)
+        else:
+            raise ValueError(f"Unknown model category for: {model_name}")
+
+        batch_item_ids = torch.unique(torch.cat([pos_ids, neg_ids]))
+        loss.backward()
+        main_optimizer.step()
+        total_loss += loss.item()
+        n_batches += 1
+
+        if model_name in I2MD4FAIR_MODELS and club_optimizer is not None:
+            club_optimizer.zero_grad()
+            club_nll = model.club_nll_loss(modality_features, batch_item_ids)
+            club_nll.backward()
+            club_optimizer.step()
+
+        if model_name in I2MD4FAIR_MODELS:
+            model.update_prototypes(modality_features, batch_item_ids)
+
+    return total_loss / max(n_batches, 1)
+
+
+def train_and_eval(model_name, dataset, args, device, n_runs=5):
+    results_all_runs = defaultdict(list)
+
+    for run in range(n_runs):
+        print(f"\n=== Run {run+1}/{n_runs} for {model_name} on {dataset.dataset_name} ===")
+        torch.manual_seed(run)
+        np.random.seed(run)
+        model = build_model(model_name, dataset, args, device)
+
+        main_params = get_main_params(model, model_name)
+        main_optimizer = torch.optim.Adam(main_params, lr=args.lr)
+
+        club_optimizer = None
+        club_params_list = get_club_params(model, model_name)
+        if club_params_list:
+            club_optimizer = torch.optim.Adam(club_params_list, lr=args.lr)
+
+        graph_norm = dataset.get_norm_graph().to(device)
+        modality_features = dataset.get_modality_features()
+        for k in modality_features:
+            modality_features[k] = modality_features[k].to(device)
+
+        inter_norm_u = None
+        inter_norm_v = None
+        if model_name in I2MD4FAIR_MODELS:
+            norm_matrices = dataset.get_modality_norm_matrices()
+            inter_norm_u = norm_matrices['inter_norm_u'].to(device)
+            inter_norm_v = norm_matrices['inter_norm_v'].to(device)
+
+        data_loader = BPRDataLoader(
+            dataset.train_data, dataset.n_users, dataset.n_items,
+            dataset.train_user_item_dict, batch_size=args.batch_size,
+            user_item_dict=dataset.user_item_dict
+        )
+
+        best_recall20 = -1.0
+        best_metrics = None
+        best_state = None
+        patience_counter = 0
+
+        for epoch in range(1, args.max_epochs + 1):
+            data_loader.shuffle()
+            loss = train_one_epoch(model, dataset, data_loader, graph_norm,
+                                   modality_features, main_optimizer, club_optimizer, device,
+                                   model_name, inter_norm_u, inter_norm_v)
+
+            if epoch % args.eval_interval == 0:
+                metrics = evaluate_model(model, dataset, device=device, K_list=[10, 20], mode='val')
+                recall20 = metrics['Recall'][20]
+                ndcg10 = metrics['NDCG'][10]
+                print(f"Epoch {epoch}: Loss={loss:.4f}, N@10={ndcg10:.4f}, "
+                      f"R@10={metrics['Recall'][10]:.4f}, R@20={recall20:.4f}, "
+                      f"G@10={metrics['Gini'][10]:.4f}, E@10={metrics['Entropy'][10]:.4f}, "
+                      f"C@10={metrics['Coverage'][10]:.4f}")
+
+                if recall20 > best_recall20:
+                    best_recall20 = recall20
+                    best_metrics = metrics
+                    best_state = copy.deepcopy(model.state_dict())
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= args.patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
+
+        if best_metrics is not None:
+            if best_state is not None:
+                model.load_state_dict(best_state)
+            test_metrics = evaluate_model(model, dataset, device=device, K_list=[10, 20], mode='test')
+            for metric_name in test_metrics:
+                for K in test_metrics[metric_name]:
+                    results_all_runs[(metric_name, K)].append(test_metrics[metric_name][K])
+
+    avg_results = {}
+    for key in results_all_runs:
+        avg_results[key] = np.mean(results_all_runs[key])
+
+    return avg_results
+
+
+def run_single_experiment(args, device):
+    dataset = DAMRSDataset(args.dataset, args.data_dir, args.embed_dim)
+
+    results = train_and_eval(args.model, dataset, args, device, n_runs=args.n_runs)
+
+    print(f"\n{'=' * 80}")
+    print(f"Results for {args.model} on {args.dataset} (avg over {args.n_runs} runs)")
+    print(f"{'=' * 80}")
+    print(f"{'N@10':>8} {'N@20':>8} {'R@10':>8} {'R@20':>8} "
+          f"{'G@10':>8} {'G@20':>8} {'E@10':>8} {'E@20':>8} {'C@10':>8} {'C@20':>8}")
+    print(f"{results.get(('NDCG', 10), 0):>8.4f} {results.get(('NDCG', 20), 0):>8.4f} "
+          f"{results.get(('Recall', 10), 0):>8.4f} {results.get(('Recall', 20), 0):>8.4f} "
+          f"{results.get(('Gini', 10), 0):>8.4f} {results.get(('Gini', 20), 0):>8.4f} "
+          f"{results.get(('Entropy', 10), 0):>8.4f} {results.get(('Entropy', 20), 0):>8.4f} "
+          f"{results.get(('Coverage', 10), 0):>8.4f} {results.get(('Coverage', 20), 0):>8.4f}")
+    return results
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', type=str, default='baby', choices=['baby', 'clothing', 'mind'])
+    parser.add_argument('--model', type=str, default='LightGCN',
+                        choices=['I2MD4Fair', 'LightGCN', 'VBPR', 'MMGCN', 'GRCN',
+                                 'LATTICE', 'FREEDOM', 'LGMRec', 'BM3', 'SLMRec',
+                                 'MMSSL', 'DiffMM', 'MENTOR',
+                                 'MMSSL+MD', 'DiffMM+MD', 'LGMRec+MD', 'MENTOR+MD'])
+    parser.add_argument('--data_dir', type=str, default='data/damrs/')
+    parser.add_argument('--embed_dim', type=int, default=64)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--batch_size', type=int, default=4096)
+    parser.add_argument('--max_epochs', type=int, default=500)
+    parser.add_argument('--eval_interval', type=int, default=5)
+    parser.add_argument('--patience', type=int, default=50)
+    parser.add_argument('--n_layers', type=int, default=2)
+    parser.add_argument('--n_runs', type=int, default=5)
+    parser.add_argument('--n_protos', type=int, default=64)
+    parser.add_argument('--eps', type=float, default=0.1)
+    parser.add_argument('--p_norm', type=float, default=2.0)
+    parser.add_argument('--lam', type=float, default=0.01)
+    parser.add_argument('--tau', type=float, default=0.01)
+    parser.add_argument('--lambda1', type=float, default=0.1)
+    parser.add_argument('--lambda2', type=float, default=0.1)
+    parser.add_argument('--lambda3', type=float, default=1e-4)
+    parser.add_argument('--device', type=str, default='cpu')
+    args = parser.parse_args()
+
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+
+    run_single_experiment(args, device)
