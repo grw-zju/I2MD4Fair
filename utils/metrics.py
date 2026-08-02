@@ -107,6 +107,7 @@ def evaluate_model(model, dataset, device='cpu', K_list=[10, 20], mode='test', e
     all_topk_indices = []
     recall_hits = {K: 0.0 for K in K_list}
     ndcg_hits = {K: 0.0 for K in K_list}
+    hr_hits = {K: 0.0 for K in K_list}
     total_users = 0
     discount = 1.0 / np.log2(np.arange(2, max(K_list) + 2, dtype=np.float64))
 
@@ -123,7 +124,7 @@ def evaluate_model(model, dataset, device='cpu', K_list=[10, 20], mode='test', e
                 _collect_batch_metrics(batch_scores, batch_users, max_k, K_list, n_items,
                                        train_user_item_dict, val_user_item_dict,
                                        target_user_item_dict, mode, all_topk_indices,
-                                       recall_hits, ndcg_hits, discount, device)
+                                       recall_hits, ndcg_hits, hr_hits, discount, device)
                 total_users += len(batch_users)
             if hasattr(model, 'clear_full_sort_cache'):
                 model.clear_full_sort_cache()
@@ -137,7 +138,7 @@ def evaluate_model(model, dataset, device='cpu', K_list=[10, 20], mode='test', e
                 _collect_batch_metrics(batch_scores, batch_users, max_k, K_list, n_items,
                                        train_user_item_dict, val_user_item_dict,
                                        target_user_item_dict, mode, all_topk_indices,
-                                       recall_hits, ndcg_hits, discount, device)
+                                       recall_hits, ndcg_hits, hr_hits, discount, device)
                 total_users += len(batch_users)
 
     if total_users == 0:
@@ -149,6 +150,7 @@ def evaluate_model(model, dataset, device='cpu', K_list=[10, 20], mode='test', e
     for K in K_list:
         metrics['NDCG'][K] = round(ndcg_hits[K] / total_users, 4)
         metrics['Recall'][K] = round(recall_hits[K] / total_users, 4)
+        metrics['HR'][K] = round(hr_hits[K] / total_users, 4)
 
         topk_at_k = topk_index_matrix[:, :K]
         num_count = Counter(list(topk_at_k.reshape(-1)))
@@ -163,13 +165,38 @@ def evaluate_model(model, dataset, device='cpu', K_list=[10, 20], mode='test', e
         metrics['Entropy'][K] = round(entropy, 4)
         metrics['Coverage'][K] = round(coverage, 4)
 
+        discount_exp = np.zeros(n_items, dtype=np.float64)
+        for row in range(topk_index_matrix.shape[0]):
+            for rank in range(K):
+                item_id = topk_index_matrix[row, rank]
+                discount_exp[item_id] += 1.0 / np.log2(rank + 2)
+        x_sum = discount_exp.sum()
+        if x_sum > 0:
+            x_norm = discount_exp / x_sum
+        else:
+            x_norm = discount_exp
+
+        q = np.zeros(n_items, dtype=np.float64)
+        for u in target_user_item_dict:
+            for i in target_user_item_dict[u]:
+                if i < n_items:
+                    q[i] += 1.0
+        q_sum = q.sum()
+        if q_sum > 0:
+            q_norm = q / q_sum
+        else:
+            q_norm = q
+
+        reg = 0.5 * np.sum(np.abs(x_norm - q_norm))
+        metrics['REG'][K] = round(reg, 4)
+
     return metrics
 
 
 def _collect_batch_metrics(batch_scores, batch_users, max_k, K_list, n_items,
                            train_user_item_dict, val_user_item_dict,
                            target_user_item_dict, mode, all_topk_indices,
-                           recall_hits, ndcg_hits, discount, device):
+                           recall_hits, ndcg_hits, hr_hits, discount, device):
     if not torch.is_tensor(batch_scores):
         batch_scores = torch.as_tensor(batch_scores, device=device)
     else:
@@ -203,6 +230,8 @@ def _collect_batch_metrics(batch_scores, batch_users, max_k, K_list, n_items,
         for K in K_list:
             hits_k = hits[:K]
             recall_hits[K] += float(hits_k.sum()) / pos_len
+            if hits_k.sum() > 0:
+                hr_hits[K] += 1.0
             idcg_len = min(pos_len, K)
             idcg = discount[:idcg_len].sum()
             dcg = (hits_k.astype(np.float64) * discount[:K]).sum()

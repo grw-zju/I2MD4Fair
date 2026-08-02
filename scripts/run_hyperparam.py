@@ -32,7 +32,7 @@ def hyperparameter_experiment(args, device):
         args.lambda1 = lam1
         avg = train_single(args, dataset, modality_dims, device, n_runs=args.n_runs)
         results['lambda1'][lam1] = avg
-        print(f"lambda1={lam1}: N@10={avg.get(('NDCG',10),0):.4f}, R@20={avg.get(('Recall',20),0):.4f}, "
+        print(f"lambda1={lam1}: N@10={avg.get(('NDCG',10),0):.4f}, R@10={avg.get(('Recall',10),0):.4f}, "
               f"C@10={avg.get(('Coverage',10),0):.4f}")
 
     print("\n=== Lambda2 (Cross-modality Alignment Loss) ===")
@@ -41,7 +41,7 @@ def hyperparameter_experiment(args, device):
         args.lambda2 = lam2
         avg = train_single(args, dataset, modality_dims, device, n_runs=args.n_runs)
         results['lambda2'][lam2] = avg
-        print(f"lambda2={lam2}: N@10={avg.get(('NDCG',10),0):.4f}, R@20={avg.get(('Recall',20),0):.4f}, "
+        print(f"lambda2={lam2}: N@10={avg.get(('NDCG',10),0):.4f}, R@10={avg.get(('Recall',10),0):.4f}, "
               f"C@10={avg.get(('Coverage',10),0):.4f}")
 
     print("\n=== Lambda (Modality Info Regularization) ===")
@@ -50,7 +50,7 @@ def hyperparameter_experiment(args, device):
         args.lam = lam_val
         avg = train_single(args, dataset, modality_dims, device, n_runs=args.n_runs)
         results['lam'][lam_val] = avg
-        print(f"lambda={lam_val}: N@10={avg.get(('NDCG',10),0):.4f}, R@20={avg.get(('Recall',20),0):.4f}, "
+        print(f"lambda={lam_val}: N@10={avg.get(('NDCG',10),0):.4f}, R@10={avg.get(('Recall',10),0):.4f}, "
               f"C@10={avg.get(('Coverage',10),0):.4f}")
 
     print("\n=== p-norm (Adaptive Fusion Order) ===")
@@ -79,6 +79,7 @@ def train_single(args, dataset, modality_dims, device, n_runs=3):
             dataset.n_users, dataset.n_items, args.embed_dim, modality_dims,
             n_protos=args.n_protos, eps=args.eps, p=args.p_norm,
             lam=args.lam, tau=args.tau, n_layers=args.n_layers,
+            n_modality_layers=args.n_modality_layers,
             lambda1=args.lambda1, lambda2=args.lambda2, lambda3=args.lambda3
         ).to(device)
 
@@ -102,13 +103,14 @@ def train_single(args, dataset, modality_dims, device, n_runs=3):
             user_item_dict=dataset.user_item_dict
         )
 
-        best_r20 = -1.0
+        best_r10 = -1.0
         best_metrics = None
         best_state = None
         patience = 0
 
         for epoch in range(1, args.max_epochs + 1):
             model.train()
+            is_warmup = epoch <= args.warmup_epochs
             for _ in range(len(data_loader)):
                 user_ids, pos_ids, neg_ids = data_loader.get_batch()
                 user_ids = user_ids.to(device)
@@ -118,22 +120,24 @@ def train_single(args, dataset, modality_dims, device, n_runs=3):
                 loss, _, _, _ = model(
                     graph_norm, modality_features, user_ids, pos_ids, neg_ids,
                     interaction_matrix_norm_u=inter_norm_u,
-                    interaction_matrix_norm_v=inter_norm_v
+                    interaction_matrix_norm_v=inter_norm_v,
+                    warmup=is_warmup
                 )
                 batch_item_ids = torch.unique(torch.cat([pos_ids, neg_ids]))
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(main_params, max_norm=5.0)
                 optimizer.step()
                 club_optimizer.zero_grad()
                 club_nll = model.club_nll_loss(modality_features, batch_item_ids)
                 club_nll.backward()
+                torch.nn.utils.clip_grad_norm_(list(club_params), max_norm=5.0)
                 club_optimizer.step()
-                model.update_prototypes(modality_features, batch_item_ids)
 
             if epoch % args.eval_interval == 0:
                 metrics = evaluate_model(model, dataset, K_list=[10, 20], device=device, mode='val')
-                r20 = metrics['Recall'][20]
-                if r20 > best_r20:
-                    best_r20 = r20
+                r10 = metrics['Recall'][10]
+                if r10 > best_r10:
+                    best_r10 = r10
                     best_metrics = metrics
                     best_state = copy.deepcopy(model.state_dict())
                     patience = 0
@@ -174,15 +178,17 @@ def save_results(results, dataset_name):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='baby', choices=['baby', 'clothing', 'mind'])
+    parser.add_argument('--dataset', type=str, default='baby', choices=['baby', 'clothing', 'mind', 'demo'])
     parser.add_argument('--data_dir', type=str, default='data/damrs/')
     parser.add_argument('--embed_dim', type=int, default=64)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--batch_size', type=int, default=4096)
-    parser.add_argument('--max_epochs', type=int, default=500)
+    parser.add_argument('--max_epochs', type=int, default=1000)
     parser.add_argument('--eval_interval', type=int, default=5)
     parser.add_argument('--patience', type=int, default=50)
     parser.add_argument('--n_layers', type=int, default=2)
+    parser.add_argument('--n_modality_layers', type=int, default=1)
+    parser.add_argument('--warmup_epochs', type=int, default=5)
     parser.add_argument('--n_runs', type=int, default=3)
     parser.add_argument('--n_protos', type=int, default=64)
     parser.add_argument('--eps', type=float, default=0.1)

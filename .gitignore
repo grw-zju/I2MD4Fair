@@ -17,8 +17,16 @@ data/Amazon/
 data 2/
 data/IMRec_repo/
 data/MIND/
-data/damrs/
+data/damrs/baby/
+data/damrs/clothing/
+data/damrs/mind/
 data/processed/
+
+# Demo dataset is tracked in-repo (small, for quick testing)
+!data/damrs/demo/
+!data/damrs/demo/**
+data/damrs/demo/_*.pt
+data/damrs/demo/_*.pkl
 
 # Generated outputs
 results/
@@ -26,3 +34,6 @@ runs/
 checkpoints/
 *.pt
 *.pth
+
+# Demo dataset files are tracked despite *.pt rule
+!data/damrs/demo/*.pt

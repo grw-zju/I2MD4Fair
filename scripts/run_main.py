@@ -59,8 +59,8 @@ def build_model(model_name, dataset, args, device):
             n_users=n_users, n_items=n_items, embed_dim=embed_dim,
             modality_dims=modality_dims, n_protos=args.n_protos,
             eps=args.eps, p=args.p_norm, lam=args.lam, tau=args.tau,
-            n_layers=args.n_layers, lambda1=args.lambda1,
-            lambda2=args.lambda2, lambda3=args.lambda3
+            n_layers=args.n_layers, n_modality_layers=args.n_modality_layers,
+            lambda1=args.lambda1, lambda2=args.lambda2, lambda3=args.lambda3
         )
     elif base_model_name == 'LightGCN':
         model = LightGCN(n_users, n_items, embed_dim, n_layers=args.n_layers)
@@ -122,10 +122,11 @@ def get_club_params(model, model_name):
 
 def train_one_epoch(model, dataset, data_loader, graph_norm, modality_features,
                     main_optimizer, club_optimizer, device, model_name,
-                    inter_norm_u=None, inter_norm_v=None):
+                    inter_norm_u=None, inter_norm_v=None, epoch=0, warmup_epochs=5):
     model.train()
     total_loss = 0
     n_batches = 0
+    is_warmup = epoch <= warmup_epochs
 
     for _ in range(len(data_loader)):
         user_ids, pos_ids, neg_ids = data_loader.get_batch()
@@ -138,7 +139,8 @@ def train_one_epoch(model, dataset, data_loader, graph_norm, modality_features,
         if model_name in I2MD4FAIR_MODELS:
             loss, _, _, _ = model(graph_norm, modality_features, user_ids, pos_ids, neg_ids,
                                  interaction_matrix_norm_u=inter_norm_u,
-                                 interaction_matrix_norm_v=inter_norm_v)
+                                 interaction_matrix_norm_v=inter_norm_v,
+                                 warmup=is_warmup)
         elif model_name in MODALITY_ONLY_MODELS:
             loss = model.compute_loss(user_ids, pos_ids, neg_ids, modality_features)
         elif model_name in GRAPH_ONLY_MODELS:
@@ -150,6 +152,7 @@ def train_one_epoch(model, dataset, data_loader, graph_norm, modality_features,
 
         batch_item_ids = torch.unique(torch.cat([pos_ids, neg_ids]))
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(main_optimizer.param_groups[0]['params'], max_norm=5.0)
         main_optimizer.step()
         total_loss += loss.item()
         n_batches += 1
@@ -158,10 +161,8 @@ def train_one_epoch(model, dataset, data_loader, graph_norm, modality_features,
             club_optimizer.zero_grad()
             club_nll = model.club_nll_loss(modality_features, batch_item_ids)
             club_nll.backward()
+            torch.nn.utils.clip_grad_norm_(club_optimizer.param_groups[0]['params'], max_norm=5.0)
             club_optimizer.step()
-
-        if model_name in I2MD4FAIR_MODELS:
-            model.update_prototypes(modality_features, batch_item_ids)
 
     return total_loss / max(n_batches, 1)
 
@@ -201,7 +202,7 @@ def train_and_eval(model_name, dataset, args, device, n_runs=5):
             user_item_dict=dataset.user_item_dict
         )
 
-        best_recall20 = -1.0
+        best_recall10 = -1.0
         best_metrics = None
         best_state = None
         patience_counter = 0
@@ -210,19 +211,21 @@ def train_and_eval(model_name, dataset, args, device, n_runs=5):
             data_loader.shuffle()
             loss = train_one_epoch(model, dataset, data_loader, graph_norm,
                                    modality_features, main_optimizer, club_optimizer, device,
-                                   model_name, inter_norm_u, inter_norm_v)
+                                   model_name, inter_norm_u, inter_norm_v,
+                                   epoch=epoch, warmup_epochs=args.warmup_epochs)
 
             if epoch % args.eval_interval == 0:
                 metrics = evaluate_model(model, dataset, device=device, K_list=[10, 20], mode='val')
-                recall20 = metrics['Recall'][20]
+                recall10 = metrics['Recall'][10]
                 ndcg10 = metrics['NDCG'][10]
                 print(f"Epoch {epoch}: Loss={loss:.4f}, N@10={ndcg10:.4f}, "
-                      f"R@10={metrics['Recall'][10]:.4f}, R@20={recall20:.4f}, "
+                      f"R@10={recall10:.4f}, R@20={metrics['Recall'][20]:.4f}, "
+                      f"HR@10={metrics.get('HR', {}).get(10, 0):.4f}, "
                       f"G@10={metrics['Gini'][10]:.4f}, E@10={metrics['Entropy'][10]:.4f}, "
                       f"C@10={metrics['Coverage'][10]:.4f}")
 
-                if recall20 > best_recall20:
-                    best_recall20 = recall20
+                if recall10 > best_recall10:
+                    best_recall10 = recall10
                     best_metrics = metrics
                     best_state = copy.deepcopy(model.state_dict())
                     patience_counter = 0
@@ -257,18 +260,22 @@ def run_single_experiment(args, device):
     print(f"Results for {args.model} on {args.dataset} (avg over {args.n_runs} runs)")
     print(f"{'=' * 80}")
     print(f"{'N@10':>8} {'N@20':>8} {'R@10':>8} {'R@20':>8} "
-          f"{'G@10':>8} {'G@20':>8} {'E@10':>8} {'E@20':>8} {'C@10':>8} {'C@20':>8}")
+          f"{'HR@10':>8} {'HR@20':>8} "
+          f"{'G@10':>8} {'G@20':>8} {'E@10':>8} {'E@20':>8} {'C@10':>8} {'C@20':>8} "
+          f"{'REG@10':>8} {'REG@20':>8}")
     print(f"{results.get(('NDCG', 10), 0):>8.4f} {results.get(('NDCG', 20), 0):>8.4f} "
           f"{results.get(('Recall', 10), 0):>8.4f} {results.get(('Recall', 20), 0):>8.4f} "
+          f"{results.get(('HR', 10), 0):>8.4f} {results.get(('HR', 20), 0):>8.4f} "
           f"{results.get(('Gini', 10), 0):>8.4f} {results.get(('Gini', 20), 0):>8.4f} "
           f"{results.get(('Entropy', 10), 0):>8.4f} {results.get(('Entropy', 20), 0):>8.4f} "
-          f"{results.get(('Coverage', 10), 0):>8.4f} {results.get(('Coverage', 20), 0):>8.4f}")
+          f"{results.get(('Coverage', 10), 0):>8.4f} {results.get(('Coverage', 20), 0):>8.4f} "
+          f"{results.get(('REG', 10), 0):>8.4f} {results.get(('REG', 20), 0):>8.4f}")
     return results
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='baby', choices=['baby', 'clothing', 'mind'])
+    parser.add_argument('--dataset', type=str, default='baby', choices=['baby', 'clothing', 'mind', 'demo'])
     parser.add_argument('--model', type=str, default='LightGCN',
                         choices=['I2MD4Fair', 'LightGCN', 'VBPR', 'MMGCN', 'GRCN',
                                  'LATTICE', 'FREEDOM', 'LGMRec', 'BM3', 'SLMRec',
@@ -278,10 +285,12 @@ if __name__ == '__main__':
     parser.add_argument('--embed_dim', type=int, default=64)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--batch_size', type=int, default=4096)
-    parser.add_argument('--max_epochs', type=int, default=500)
+    parser.add_argument('--max_epochs', type=int, default=1000)
     parser.add_argument('--eval_interval', type=int, default=5)
     parser.add_argument('--patience', type=int, default=50)
     parser.add_argument('--n_layers', type=int, default=2)
+    parser.add_argument('--n_modality_layers', type=int, default=1)
+    parser.add_argument('--warmup_epochs', type=int, default=5)
     parser.add_argument('--n_runs', type=int, default=5)
     parser.add_argument('--n_protos', type=int, default=64)
     parser.add_argument('--eps', type=float, default=0.1)
