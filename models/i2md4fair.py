@@ -291,16 +291,14 @@ class I2MD4Fair(nn.Module):
             Z_U = inter_norm_u @ Z_I_debiased
         return Z_U
 
-    def _build_batch_local_users(self, user_ids, pos_ids, Z_I_debiased_batch):
+    def _build_batch_local_users(self, user_ids, pos_local, Z_I_debiased_batch):
         batch_user_ids = torch.unique(user_ids)
         user_local = torch.searchsorted(batch_user_ids, user_ids)
         n_batch_users = batch_user_ids.shape[0]
         n_batch_items = Z_I_debiased_batch.shape[0]
 
         row = user_local
-        col = pos_ids.new_zeros(len(pos_ids))
-        unique_items, inverse = torch.unique(pos_ids, return_inverse=True)
-        col = inverse
+        col = pos_local
         vals = torch.ones(len(row), dtype=torch.float, device=Z_I_debiased_batch.device)
 
         if len(row) > 0:

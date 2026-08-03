@@ -119,14 +119,15 @@ def train_single(args, dataset, modality_dims, device, n_runs=3):
                 batch_item_ids = torch.unique(torch.cat([pos_ids, neg_ids]))
 
                 Z_I_full_dict = model._compute_modality_reprs(
-                    modality_features, inter_norm_u, inter_norm_v, detach=True)
+                    modality_features, inter_norm_u, inter_norm_v, detach=False)
+                club_Z_I_full_dict = {k: v.detach() for k, v in Z_I_full_dict.items()}
 
                 club_optimizer.zero_grad()
                 club_nll = model.club_nll_loss(
                     modality_features, graph_norm=graph_norm,
                     interaction_matrix_norm_u=inter_norm_u,
                     interaction_matrix_norm_v=inter_norm_v,
-                    item_ids=batch_item_ids, Z_I_full_dict=Z_I_full_dict)
+                    item_ids=batch_item_ids, Z_I_full_dict=club_Z_I_full_dict)
                 club_nll.backward()
                 torch.nn.utils.clip_grad_norm_(list(club_params), max_norm=5.0)
                 club_optimizer.step()

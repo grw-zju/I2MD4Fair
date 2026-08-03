@@ -155,6 +155,8 @@ def build_model(model_name, dataset, args, device):
     target = model.base_model if hasattr(model, 'base_model') else model
     if hasattr(target, 'set_precomputed_adj'):
         target.set_precomputed_adj(dataset.get_adj_matrices())
+    if hasattr(target, 'set_train_interactions'):
+        target.set_train_interactions(dataset.train_data, dataset.n_users, dataset.n_items)
 
     return model.to(device)
 
@@ -208,7 +210,8 @@ def train_one_epoch(model, dataset, data_loader, graph_norm, modality_features,
         Z_I_full_dict = None
         if model_name in I2MD4FAIR_MODELS:
             Z_I_full_dict = model._compute_modality_reprs(
-                modality_features, inter_norm_u, inter_norm_v, detach=True)
+                modality_features, inter_norm_u, inter_norm_v, detach=False)
+            club_Z_I_full_dict = {k: v.detach() for k, v in Z_I_full_dict.items()}
 
         if needs_club:
             club_optimizer.zero_grad()
@@ -217,7 +220,7 @@ def train_one_epoch(model, dataset, data_loader, graph_norm, modality_features,
                     modality_features, graph_norm=graph_norm,
                     interaction_matrix_norm_u=inter_norm_u,
                     interaction_matrix_norm_v=inter_norm_v,
-                    item_ids=batch_item_ids, Z_I_full_dict=Z_I_full_dict)
+                    item_ids=batch_item_ids, Z_I_full_dict=club_Z_I_full_dict)
             else:
                 club_nll = model.club_nll_loss(modality_features, batch_item_ids)
             club_nll.backward()

@@ -211,6 +211,7 @@ class DiffMM(nn.Module):
 
         self._modality_adjs = None
         self._ui_adj = None
+        self._train_inter = None
 
     def set_precomputed_adj(self, adj_matrices):
         if adj_matrices is not None:
@@ -309,14 +310,8 @@ class DiffMM(nn.Module):
         return graph_norm
 
     def compute_loss(self, user_ids, pos_ids, neg_ids, graph_norm, modality_features):
-        if self._modality_adjs is None:
-            modality_adjs = {}
-            for k in modality_features:
-                modality_adjs[k] = graph_norm
-        else:
-            modality_adjs = {}
-            for k in modality_features:
-                modality_adjs[k] = graph_norm
+        modality_adjs = {k: graph_norm for k in modality_features}
+
         usr_embeds, itm_embeds = self._forward_mm(graph_norm, modality_adjs, modality_features)
         ancs = user_ids
         poss = pos_ids
@@ -340,15 +335,23 @@ class DiffMM(nn.Module):
                 cl_loss = cl_loss + self._contrastive_loss(v_u, v_u2, ancs, self.temp) * self.ssl_reg
                 cl_loss = cl_loss + self._contrastive_loss(v_i, v_i2, poss, self.temp) * self.ssl_reg
 
-        return bpr_loss + reg_loss + cl_loss
+        diff_loss = torch.tensor(0.0, device=user_ids.device)
+        i_embeds = self.iEmbeds.detach()
+        batch_size = min(64, self.n_users)
+        batch_users = torch.randint(0, self.n_users, (batch_size,), device=user_ids.device)
+        if self._train_inter is not None:
+            x_start = self._train_inter[batch_users].to(user_ids.device)
+        else:
+            x_start = torch.zeros(batch_size, self.n_items, device=user_ids.device)
+
+        for k in modality_features:
+            mod_feats = self._get_modality_feats(modality_features)[k].detach()
+            dl, gl = self.diffusion.training_losses(
+                self.denoise_models[k], x_start, i_embeds, batch_users, mod_feats)
+            diff_loss = diff_loss + dl.mean() + gl.mean() * self.e_loss
+
+        return bpr_loss + reg_loss + cl_loss + diff_loss
 
     def get_embs(self, graph_norm, modality_features):
-        if self._modality_adjs is None:
-            modality_adjs = {}
-            for k in modality_features:
-                modality_adjs[k] = graph_norm
-        else:
-            modality_adjs = {}
-            for k in modality_features:
-                modality_adjs[k] = graph_norm
+        modality_adjs = {k: graph_norm for k in modality_features}
         return self._forward_mm(graph_norm, modality_adjs, modality_features)
