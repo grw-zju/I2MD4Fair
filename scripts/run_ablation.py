@@ -14,130 +14,37 @@ from data.dataset import DAMRSDataset
 from utils.data_utils import BPRDataLoader
 from utils.metrics import evaluate_model
 from models.i2md4fair import (
-    I2MD4Fair, IntraMDM, InterMDM, CLUBEstimator,
-    InfoNCELoss, HypergraphConv, SoftPrototypeClustering, SinkhornOT
+    I2MD4Fair, IntraMDM, CLUBEstimator, InfoNCELoss,
+    HypergraphConv, SoftPrototypeClustering, SinkhornOT, PairwiseGCN
 )
 
 
-def ablation_experiment(args, device):
-    dataset = DAMRSDataset(args.dataset, args.data_dir, args.embed_dim)
-    modality_dims = dataset.get_modality_features_dim()
-
-    configs = [
-        ('LightGCN+M', 'lightgcn_m'),
-        ('+ k-means, GCN', 'kmeans_gcn'),
-        ('+ k-means, HGCN', 'kmeans_hgcn'),
-        ('+ soft prototype, GCN', 'soft_proto_gcn'),
-        ('+ Intra', 'intra_only'),
-        ('+ IB', 'ib_only'),
-        ('+ IB, Average fusion', 'ib_avg_fusion'),
-        ('+ Adaptive p-norm', 'adaptive_pnorm'),
-        ('+ Inter', 'inter_only'),
-        ('I2MD4Fair', 'full'),
-    ]
-
-    all_results = {}
-
-    for name, config in configs:
-        print(f"\n=== Ablation: {name} ===")
-        results = run_ablation_config(config, dataset, modality_dims, args, device,
-                                      n_runs=args.n_runs)
-        all_results[name] = results
-
-    print_ablation_table(all_results)
-    return all_results
-
-
-def run_ablation_config(config, dataset, modality_dims, args, device, n_runs=5):
-    results_all = defaultdict(list)
-
-    for run in range(n_runs):
-        model = build_ablation_model(config, dataset, modality_dims, args, device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-        graph_norm = dataset.get_norm_graph().to(device)
-        norm_matrices = dataset.get_modality_norm_matrices()
-        inter_norm_u = norm_matrices['inter_norm_u'].to(device)
-        inter_norm_v = norm_matrices['inter_norm_v'].to(device)
-        modality_features = dataset.get_modality_features()
-        for k in modality_features:
-            modality_features[k] = modality_features[k].to(device)
-
-        data_loader = BPRDataLoader(
-            dataset.train_data, dataset.n_users, dataset.n_items,
-            dataset.train_user_item_dict, batch_size=args.batch_size,
-            user_item_dict=dataset.user_item_dict
-        )
-
-        best_r10 = -1.0
-        best_metrics = None
-        best_state = None
-        patience = 0
-
-        for epoch in range(1, args.max_epochs + 1):
-            model.train()
-            is_warmup = epoch <= args.warmup_epochs
-            for _ in range(len(data_loader)):
-                user_ids, pos_ids, neg_ids = data_loader.get_batch()
-                user_ids = user_ids.to(device)
-                pos_ids = pos_ids.to(device)
-                neg_ids = neg_ids.to(device)
-                optimizer.zero_grad()
-
-                if config == 'lightgcn_m':
-                    loss = model.compute_loss(user_ids, pos_ids, neg_ids, graph_norm)
-                elif config == 'full':
-                    loss, _, _, _ = model(
-                        graph_norm, modality_features, user_ids, pos_ids, neg_ids,
-                        interaction_matrix_norm_u=inter_norm_u,
-                        interaction_matrix_norm_v=inter_norm_v,
-                        warmup=is_warmup
-                    )
-                else:
-                    loss, _, _, _ = model(
-                        graph_norm, modality_features, user_ids, pos_ids, neg_ids,
-                        interaction_matrix_norm_u=inter_norm_u,
-                        interaction_matrix_norm_v=inter_norm_v,
-                        warmup=is_warmup
-                    )
-
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                optimizer.step()
-
-            if epoch % args.eval_interval == 0:
-                metrics = evaluate_model(model, dataset, K_list=[10, 20], device=device, mode='val')
-                r10 = metrics['Recall'][10]
-                if r10 > best_r10:
-                    best_r10 = r10
-                    best_metrics = metrics
-                    best_state = copy.deepcopy(model.state_dict())
-                    patience = 0
-                else:
-                    patience += 1
-                if patience >= args.patience:
-                    break
-
-        if best_metrics:
-            if best_state is not None:
-                model.load_state_dict(best_state)
-            test_metrics = evaluate_model(model, dataset, K_list=[10, 20], device=device, mode='test')
-            for m in test_metrics:
-                for K in test_metrics[m]:
-                    results_all[(m, K)].append(test_metrics[m][K])
-
-    avg = {}
-    for key in results_all:
-        avg[key] = np.mean(results_all[key])
-    return avg
+def lloyd_kmeans(X, n_clusters, n_iters=10):
+    with torch.no_grad():
+        n = X.shape[0]
+        k = min(n_clusters, n)
+        indices = torch.randperm(n)[:k]
+        centroids = X[indices].clone()
+        for _ in range(n_iters):
+            dists = torch.cdist(X, centroids)
+            assignments = dists.argmin(dim=1)
+            for t in range(k):
+                mask = assignments == t
+                if mask.any():
+                    centroids[t] = X[mask].mean(dim=0)
+        dists = torch.cdist(X, centroids)
+        assignments = dists.argmin(dim=1)
+        one_hot = torch.zeros(n, k, device=X.device)
+        one_hot.scatter_(1, assignments.unsqueeze(1), 1.0)
+    return one_hot
 
 
 class AblationModel(nn.Module):
     def __init__(self, n_users, n_items, embed_dim, modality_dims,
-                 use_intra=False, use_soft_proto=False, use_hgcn=False,
-                 use_inter=False, use_ib=False, use_adaptive=False,
-                 use_avg_fusion=False, n_protos=64, eps=0.1, tau=0.01,
-                 n_layers=2, n_modality_layers=1,
+                 use_lightgcn_m=False, use_intra=False, use_soft_proto=False,
+                 use_hgcn=False, use_gcn=False, use_inter=False, use_ib=False,
+                 use_adaptive=False, use_avg_fusion=False,
+                 n_protos=64, eps=0.1, tau=0.01, n_layers=2, n_modality_layers=1,
                  lam=0.01, p_norm=2.0, lambda1=0.1, lambda2=0.1, lambda3=1e-4):
         super().__init__()
         self.n_users = n_users
@@ -145,9 +52,11 @@ class AblationModel(nn.Module):
         self.embed_dim = embed_dim
         self.n_layers = n_layers
         self.n_modality_layers = n_modality_layers
+        self.use_lightgcn_m = use_lightgcn_m
         self.use_intra = use_intra
         self.use_soft_proto = use_soft_proto
         self.use_hgcn = use_hgcn
+        self.use_gcn = use_gcn
         self.use_inter = use_inter
         self.use_ib = use_ib
         self.use_adaptive = use_adaptive
@@ -179,40 +88,35 @@ class AblationModel(nn.Module):
             for k in modality_dims:
                 self.intra_mdm[k] = IntraMDM(n_items, n_protos, embed_dim, eps)
 
-        if use_hgcn and not use_intra:
-            self.hgcn_layers = nn.ModuleDict()
+        if (use_gcn or use_hgcn) and not use_intra and not use_soft_proto:
+            self.prop_layers = nn.ModuleDict()
             for k in modality_dims:
-                self.hgcn_layers[k] = HypergraphConv(embed_dim)
-            self.prototypes_abl = nn.ParameterDict()
-            for k in modality_dims:
-                p = torch.empty(n_protos, embed_dim)
-                nn.init.xavier_uniform_(p)
-                self.prototypes_abl[k] = nn.Parameter(p)
+                if use_hgcn:
+                    self.prop_layers[k] = HypergraphConv(embed_dim)
+                else:
+                    self.prop_layers[k] = PairwiseGCN(embed_dim)
 
-        if use_soft_proto and not use_intra and not use_hgcn:
-            self.gc_layers = nn.ModuleDict()
+        if use_soft_proto and not use_intra:
+            self.soft_ot = nn.ModuleDict()
             for k in modality_dims:
-                self.gc_layers[k] = HypergraphConv(embed_dim)
-            self.prototypes_abl = nn.ParameterDict()
-            for k in modality_dims:
-                p = torch.empty(n_protos, embed_dim)
-                nn.init.xavier_uniform_(p)
-                self.prototypes_abl[k] = nn.Parameter(p)
-
-        if not use_intra and not use_hgcn and not use_soft_proto:
-            self.kmeans_protos = nn.ParameterDict()
+                self.soft_ot[k] = SinkhornOT(eps=eps, n_iters=3)
+            self.prototypes = nn.ParameterDict()
             for k in modality_dims:
                 p = torch.empty(n_protos, embed_dim)
                 nn.init.xavier_uniform_(p)
-                self.kmeans_protos[k] = nn.Parameter(p)
-            self.kmeans_gc = nn.ModuleDict()
+                self.prototypes[k] = nn.Parameter(p)
+            self.prop_layers = nn.ModuleDict()
             for k in modality_dims:
-                self.kmeans_gc[k] = HypergraphConv(embed_dim)
+                if use_hgcn:
+                    self.prop_layers[k] = HypergraphConv(embed_dim)
+                else:
+                    self.prop_layers[k] = PairwiseGCN(embed_dim)
 
         if use_inter:
-            self.club_estimators = nn.ModuleDict()
-            for k, dim in modality_dims.items():
-                self.club_estimators[k] = CLUBEstimator(dim, embed_dim)
+            if use_ib:
+                self.club_estimators = nn.ModuleDict()
+                for k, dim in modality_dims.items():
+                    self.club_estimators[k] = CLUBEstimator(dim, embed_dim)
 
         self.info_nce = InfoNCELoss(tau=tau)
 
@@ -237,26 +141,13 @@ class AblationModel(nn.Module):
             else:
                 E_I = inter_norm_v @ E_U
         if self.n_modality_layers == 0:
-            Z_I = E_I_init
-        else:
-            Z_I = (E_I_init + E_I) / (self.n_modality_layers + 1)
-        return Z_I
+            return E_I_init
+        return (E_I_init + E_I) / (self.n_modality_layers + 1)
 
     def _reconstruct_modality_user(self, inter_norm_u, Z_I_debiased):
         if inter_norm_u.is_sparse:
-            Z_U = torch.sparse.mm(inter_norm_u, Z_I_debiased)
-        else:
-            Z_U = inter_norm_u @ Z_I_debiased
-        return Z_U
-
-    def _kmeans_assignment(self, Z_v, prototypes):
-        Z_norm = F.normalize(Z_v, dim=1)
-        P_norm = F.normalize(prototypes, dim=1)
-        cost = 1 - Z_norm @ P_norm.T
-        _, indices = torch.min(cost, dim=1)
-        one_hot = torch.zeros(Z_v.shape[0], prototypes.shape[0], device=Z_v.device)
-        one_hot.scatter_(1, indices.unsqueeze(1), 1.0)
-        return one_hot
+            return torch.sparse.mm(inter_norm_u, Z_I_debiased)
+        return inter_norm_u @ Z_I_debiased
 
     def forward(self, graph_norm, modality_features, user_ids, pos_ids, neg_ids,
                 interaction_matrix_norm_u=None, interaction_matrix_norm_v=None,
@@ -273,27 +164,28 @@ class AblationModel(nn.Module):
 
             if interaction_matrix_norm_u is not None and interaction_matrix_norm_v is not None:
                 Z_I_k = self._modality_init_propagation(
-                    interaction_matrix_norm_u, interaction_matrix_norm_v, E_I_k
-                )
+                    interaction_matrix_norm_u, interaction_matrix_norm_v, E_I_k)
             else:
                 Z_I_k = E_I_k
 
             if self.use_intra:
-                Z_I_k_debiased, gamma_k = self.intra_mdm[k](Z_I_k)
-            elif self.use_hgcn:
-                one_hot = self._kmeans_assignment(Z_I_k, self.prototypes_abl[k])
+                Z_I_k_debiased, _ = self.intra_mdm[k](Z_I_k)
+            elif self.use_hgcn and not self.use_soft_proto:
+                one_hot = lloyd_kmeans(Z_I_k, self.prototypes_abl[k].shape[0] if hasattr(self, 'prototypes_abl') else 64)
                 incidence = Z_I_k.shape[0] * one_hot
-                Z_I_k_debiased = self.hgcn_layers[k](Z_I_k, incidence)
+                Z_I_k_debiased = self.prop_layers[k](Z_I_k, incidence)
             elif self.use_soft_proto:
                 Z_norm = F.normalize(Z_I_k, dim=1)
-                P_norm = F.normalize(self.prototypes_abl[k], dim=1)
-                gamma = SinkhornOT(eps=0.1, n_iters=3)(1 - Z_norm @ P_norm.T)
+                P_norm = F.normalize(self.prototypes[k], dim=1)
+                gamma = self.soft_ot[k](1 - Z_norm @ P_norm.T)
                 incidence = Z_I_k.shape[0] * gamma
-                Z_I_k_debiased = self.gc_layers[k](Z_I_k, incidence)
-            else:
-                one_hot = self._kmeans_assignment(Z_I_k, self.kmeans_protos[k])
+                Z_I_k_debiased = self.prop_layers[k](Z_I_k, incidence)
+            elif self.use_gcn:
+                one_hot = lloyd_kmeans(Z_I_k, 64)
                 incidence = Z_I_k.shape[0] * one_hot
-                Z_I_k_debiased = self.kmeans_gc[k](Z_I_k, incidence)
+                Z_I_k_debiased = self.prop_layers[k](Z_I_k, incidence)
+            else:
+                Z_I_k_debiased = Z_I_k
 
             Z_I_debiased_dict[k] = Z_I_k_debiased
             Z_I_dict[k] = Z_I_k_debiased
@@ -318,7 +210,6 @@ class AblationModel(nn.Module):
         bpr_loss = -F.logsigmoid(pos_scores - neg_scores).mean()
 
         per_modality_losses = {}
-        mi_terms = {}
         for k in modality_features:
             u_k = Z_U_dict[k][user_ids]
             pos_k = Z_I_dict[k][pos_ids]
@@ -329,20 +220,14 @@ class AblationModel(nn.Module):
 
             if self.use_ib:
                 M_k = modality_features[k][batch_item_ids]
-                Z_v_k_debiased = Z_I_debiased_dict[k][batch_item_ids]
-                mu, logvar = self.club_estimators[k](M_k)
-                log_pos = self.club_estimators[k].log_prob(Z_v_k_debiased, mu, logvar).sum(dim=-1)
-                shuffled = Z_v_k_debiased[torch.randperm(Z_v_k_debiased.shape[0])]
-                log_neg = self.club_estimators[k].log_prob(shuffled, mu, logvar).sum(dim=-1)
-                mi_est = torch.clamp((log_pos - log_neg).mean(), min=0)
-                mi_terms[k] = mi_est
+                Z_k = Z_I_debiased_dict[k][batch_item_ids]
+                mi_est = self.club_estimators[k].mi_upper_bound(M_k, Z_k)
                 if warmup:
                     total_k = rec_loss_k
                 else:
                     total_k = rec_loss_k + self.lam * mi_est
             else:
                 total_k = rec_loss_k
-
             per_modality_losses[k] = total_k
 
         if self.use_adaptive:
@@ -350,6 +235,8 @@ class AblationModel(nn.Module):
             adaptive_loss = torch.pow(torch.sum(torch.pow(loss_values, self.p_norm)), 1.0 / self.p_norm)
         elif self.use_avg_fusion:
             adaptive_loss = sum(per_modality_losses.values()) / len(per_modality_losses)
+        elif self.use_inter:
+            adaptive_loss = sum(per_modality_losses.values())
         else:
             adaptive_loss = sum(per_modality_losses.values())
 
@@ -359,6 +246,21 @@ class AblationModel(nn.Module):
 
         total_loss = bpr_loss + self.lambda1 * adaptive_loss + self.lambda2 * info_nce_loss + self.lambda3 * l2_reg
         return total_loss, bpr_loss, adaptive_loss, info_nce_loss
+
+    def club_nll_loss(self, modality_features, item_ids=None):
+        if not self.use_ib:
+            return torch.tensor(0.0)
+        total_nll = torch.tensor(0.0, device=next(self.parameters()).device)
+        for k in self.club_estimators:
+            M_k = modality_features[k]
+            if item_ids is not None:
+                M_k = M_k[item_ids]
+            Z_k = self.modality_encoders[k](M_k)
+            if self.use_intra:
+                Z_k, _ = self.intra_mdm[k](Z_k)
+            Z_k = Z_k.detach()
+            total_nll = total_nll + self.club_estimators[k].nll_loss(M_k, Z_k)
+        return total_nll
 
     def get_user_item_embs(self, graph_norm, modality_features,
                            interaction_matrix_norm_u=None, interaction_matrix_norm_v=None):
@@ -372,27 +274,28 @@ class AblationModel(nn.Module):
 
             if interaction_matrix_norm_u is not None and interaction_matrix_norm_v is not None:
                 Z_I_k = self._modality_init_propagation(
-                    interaction_matrix_norm_u, interaction_matrix_norm_v, E_I_k
-                )
+                    interaction_matrix_norm_u, interaction_matrix_norm_v, E_I_k)
             else:
                 Z_I_k = E_I_k
 
             if self.use_intra:
                 Z_I_k_debiased, _ = self.intra_mdm[k](Z_I_k)
-            elif self.use_hgcn:
-                one_hot = self._kmeans_assignment(Z_I_k, self.prototypes_abl[k])
+            elif self.use_hgcn and not self.use_soft_proto:
+                one_hot = lloyd_kmeans(Z_I_k, 64)
                 incidence = Z_I_k.shape[0] * one_hot
-                Z_I_k_debiased = self.hgcn_layers[k](Z_I_k, incidence)
+                Z_I_k_debiased = self.prop_layers[k](Z_I_k, incidence)
             elif self.use_soft_proto:
                 Z_norm = F.normalize(Z_I_k, dim=1)
-                P_norm = F.normalize(self.prototypes_abl[k], dim=1)
-                gamma = SinkhornOT(eps=0.1, n_iters=3)(1 - Z_norm @ P_norm.T)
+                P_norm = F.normalize(self.prototypes[k], dim=1)
+                gamma = self.soft_ot[k](1 - Z_norm @ P_norm.T)
                 incidence = Z_I_k.shape[0] * gamma
-                Z_I_k_debiased = self.gc_layers[k](Z_I_k, incidence)
-            else:
-                one_hot = self._kmeans_assignment(Z_I_k, self.kmeans_protos[k])
+                Z_I_k_debiased = self.prop_layers[k](Z_I_k, incidence)
+            elif self.use_gcn:
+                one_hot = lloyd_kmeans(Z_I_k, 64)
                 incidence = Z_I_k.shape[0] * one_hot
-                Z_I_k_debiased = self.kmeans_gc[k](Z_I_k, incidence)
+                Z_I_k_debiased = self.prop_layers[k](Z_I_k, incidence)
+            else:
+                Z_I_k_debiased = Z_I_k
 
             Z_I_dict[k] = Z_I_k_debiased
 
@@ -410,15 +313,132 @@ class AblationModel(nn.Module):
         return hat_X_U, hat_X_V
 
 
-def build_ablation_model(config, dataset, modality_dims, args, device):
-    from baseline.lightgcn import LightGCN
+def ablation_experiment(args, device):
+    dataset = DAMRSDataset(args.dataset, args.data_dir, args.embed_dim)
+    modality_dims = dataset.get_modality_features_dim()
 
+    configs = [
+        ('LightGCN+M', 'lightgcn_m'),
+        ('+ k-means, GCN', 'kmeans_gcn'),
+        ('+ k-means, HGCN', 'kmeans_hgcn'),
+        ('+ soft prototype, GCN', 'soft_proto_gcn'),
+        ('+ Intra', 'intra_only'),
+        ('+ IB', 'ib_only'),
+        ('+ IB, Average fusion', 'ib_avg_fusion'),
+        ('+ Adaptive p-norm', 'adaptive_pnorm'),
+        ('+ Inter', 'inter_only'),
+        ('I2MD4Fair', 'full'),
+    ]
+
+    all_results = {}
+    for name, config in configs:
+        print(f"\n=== Ablation: {name} ===")
+        results = run_ablation_config(config, dataset, modality_dims, args, device, n_runs=args.n_runs)
+        all_results[name] = results
+
+    print_ablation_table(all_results)
+    return all_results
+
+
+def run_ablation_config(config, dataset, modality_dims, args, device, n_runs=5):
+    results_all = defaultdict(list)
+
+    for run in range(n_runs):
+        model = build_ablation_model(config, dataset, modality_dims, args, device)
+
+        club_params = set()
+        if hasattr(model, 'club_estimators'):
+            for estimator in model.club_estimators.values():
+                club_params.update(estimator.parameters())
+        main_params = [p for p in model.parameters() if p not in club_params]
+        main_optimizer = torch.optim.Adam(main_params, lr=args.lr)
+        club_optimizer = torch.optim.Adam(list(club_params), lr=args.lr) if club_params else None
+
+        graph_norm = dataset.get_norm_graph().to(device)
+        norm_matrices = dataset.get_modality_norm_matrices()
+        inter_norm_u = norm_matrices['inter_norm_u'].to(device)
+        inter_norm_v = norm_matrices['inter_norm_v'].to(device)
+        modality_features = dataset.get_modality_features()
+        for k in modality_features:
+            modality_features[k] = modality_features[k].to(device)
+
+        data_loader = BPRDataLoader(
+            dataset.train_data, dataset.n_users, dataset.n_items,
+            dataset.train_user_item_dict, batch_size=args.batch_size,
+            user_item_dict=dataset.user_item_dict
+        )
+
+        best_r10 = -1.0
+        best_metrics = None
+        best_state = None
+        patience = 0
+
+        for epoch in range(1, args.max_epochs + 1):
+            model.train()
+            is_warmup = epoch <= args.warmup_epochs
+            for _ in range(len(data_loader)):
+                user_ids, pos_ids, neg_ids = data_loader.get_batch()
+                user_ids = user_ids.to(device)
+                pos_ids = pos_ids.to(device)
+                neg_ids = neg_ids.to(device)
+                batch_item_ids = torch.unique(torch.cat([pos_ids, neg_ids]))
+
+                if club_optimizer is not None:
+                    club_optimizer.zero_grad()
+                    club_nll = model.club_nll_loss(modality_features, batch_item_ids)
+                    club_nll.backward()
+                    torch.nn.utils.clip_grad_norm_(list(club_params), max_norm=5.0)
+                    club_optimizer.step()
+
+                main_optimizer.zero_grad()
+                if config == 'full':
+                    loss, _, _, _ = model(
+                        graph_norm, modality_features, user_ids, pos_ids, neg_ids,
+                        interaction_matrix_norm_u=inter_norm_u,
+                        interaction_matrix_norm_v=inter_norm_v,
+                        warmup=is_warmup)
+                else:
+                    loss, _, _, _ = model(
+                        graph_norm, modality_features, user_ids, pos_ids, neg_ids,
+                        interaction_matrix_norm_u=inter_norm_u,
+                        interaction_matrix_norm_v=inter_norm_v,
+                        warmup=is_warmup)
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(main_params, max_norm=5.0)
+                main_optimizer.step()
+
+            if epoch % args.eval_interval == 0:
+                metrics = evaluate_model(model, dataset, K_list=[10, 20], device=device, mode='val')
+                r10 = metrics['Recall'][10]
+                if r10 > best_r10:
+                    best_r10 = r10
+                    best_metrics = metrics
+                    best_state = copy.deepcopy(model.state_dict())
+                    patience = 0
+                else:
+                    patience += 1
+                if patience >= args.patience:
+                    break
+
+        if best_metrics:
+            if best_state is not None:
+                model.load_state_dict(best_state)
+            test_metrics = evaluate_model(model, dataset, K_list=[10, 20], device=device, mode='test')
+            for m in test_metrics:
+                for K in test_metrics[m]:
+                    results_all[(m, K)].append(test_metrics[m][K])
+
+    avg = {}
+    for key in results_all:
+        avg[key] = np.mean(results_all[key])
+    return avg
+
+
+def build_ablation_model(config, dataset, modality_dims, args, device):
     n_users = dataset.n_users
     n_items = dataset.n_items
     embed_dim = args.embed_dim
-
-    if config == 'lightgcn_m':
-        return LightGCN(n_users, n_items, embed_dim, n_layers=args.n_layers).to(device)
 
     if config == 'full':
         return I2MD4Fair(
@@ -430,22 +450,15 @@ def build_ablation_model(config, dataset, modality_dims, args, device):
         ).to(device)
 
     config_map = {
-        'kmeans_gcn': dict(use_intra=False, use_soft_proto=False, use_hgcn=False,
-                          use_inter=False, use_ib=False, use_adaptive=False),
-        'kmeans_hgcn': dict(use_intra=False, use_soft_proto=False, use_hgcn=True,
-                           use_inter=False, use_ib=False, use_adaptive=False),
-        'soft_proto_gcn': dict(use_intra=False, use_soft_proto=True, use_hgcn=False,
-                              use_inter=False, use_ib=False, use_adaptive=False),
-        'intra_only': dict(use_intra=True, use_soft_proto=True, use_hgcn=True,
-                          use_inter=False, use_ib=False, use_adaptive=False),
-        'ib_only': dict(use_intra=False, use_soft_proto=False, use_hgcn=False,
-                       use_inter=True, use_ib=True, use_adaptive=False),
-        'ib_avg_fusion': dict(use_intra=False, use_soft_proto=False, use_hgcn=False,
-                            use_inter=True, use_ib=True, use_avg_fusion=True, use_adaptive=False),
-        'adaptive_pnorm': dict(use_intra=False, use_soft_proto=False, use_hgcn=False,
-                              use_inter=True, use_ib=False, use_adaptive=True),
-        'inter_only': dict(use_intra=False, use_soft_proto=False, use_hgcn=False,
-                          use_inter=True, use_ib=True, use_adaptive=True),
+        'lightgcn_m': dict(use_lightgcn_m=True),
+        'kmeans_gcn': dict(use_gcn=True),
+        'kmeans_hgcn': dict(use_hgcn=True),
+        'soft_proto_gcn': dict(use_soft_proto=True, use_gcn=True),
+        'intra_only': dict(use_intra=True),
+        'ib_only': dict(use_inter=True, use_ib=True),
+        'ib_avg_fusion': dict(use_inter=True, use_ib=True, use_avg_fusion=True),
+        'adaptive_pnorm': dict(use_inter=True, use_adaptive=True),
+        'inter_only': dict(use_inter=True, use_ib=True, use_adaptive=True),
     }
 
     cfg = config_map[config]
@@ -458,12 +471,12 @@ def build_ablation_model(config, dataset, modality_dims, args, device):
 
 
 def print_ablation_table(all_results):
-    print("\n" + "=" * 140)
+    print("\n" + "=" * 160)
     print(f"{'Model':<30} {'N@10':>8} {'N@20':>8} {'R@10':>8} {'R@20':>8} "
           f"{'HR@10':>8} {'HR@20':>8} "
           f"{'G@10':>8} {'G@20':>8} {'E@10':>8} {'E@20':>8} {'C@10':>8} {'C@20':>8} "
           f"{'REG@10':>8} {'REG@20':>8}")
-    print("=" * 140)
+    print("=" * 160)
     for name in all_results:
         r = all_results[name]
         print(f"{name:<30} "
@@ -493,11 +506,11 @@ if __name__ == '__main__':
     parser.add_argument('--n_protos', type=int, default=64)
     parser.add_argument('--eps', type=float, default=0.1)
     parser.add_argument('--p_norm', type=float, default=2.0)
-    parser.add_argument('--lam', type=float, default=0.01)
+    parser.add_argument('--lam', '--lambda_ib', type=float, default=0.01, dest='lam')
     parser.add_argument('--tau', type=float, default=0.01)
-    parser.add_argument('--lambda1', type=float, default=0.1)
-    parser.add_argument('--lambda2', type=float, default=0.1)
-    parser.add_argument('--lambda3', type=float, default=1e-4)
+    parser.add_argument('--lambda1', '--lambda_amb', type=float, default=0.1, dest='lambda1')
+    parser.add_argument('--lambda2', '--lambda_cl', type=float, default=0.1, dest='lambda2')
+    parser.add_argument('--lambda3', '--lambda_reg', type=float, default=1e-4, dest='lambda3')
     parser.add_argument('--device', type=str, default='cpu')
     args = parser.parse_args()
 

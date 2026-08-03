@@ -16,6 +16,19 @@ from utils.metrics import evaluate_model
 from models.i2md4fair import IntraMDM, CLUBEstimator, InfoNCELoss
 
 
+class _PatchedEncoder(nn.Module):
+    def __init__(self, original_encoder, intra_mdm=None):
+        super().__init__()
+        self.original_encoder = original_encoder
+        self.intra_mdm = intra_mdm
+
+    def forward(self, x):
+        z = self.original_encoder(x)
+        if self.intra_mdm is not None:
+            z, _ = self.intra_mdm(z)
+        return z
+
+
 class BackboneWithDebias(nn.Module):
     def __init__(self, base_model, modality_dims, embed_dim,
                  use_intra=False, use_inter=False,
@@ -34,6 +47,13 @@ class BackboneWithDebias(nn.Module):
             self.intra_mdm = nn.ModuleDict()
             for k in modality_dims:
                 self.intra_mdm[k] = IntraMDM(self.n_items, n_protos, embed_dim, eps)
+            for k in modality_dims:
+                if hasattr(base_model, 'modality_encoders') and k in base_model.modality_encoders:
+                    base_model.modality_encoders[k] = _PatchedEncoder(
+                        base_model.modality_encoders[k], self.intra_mdm[k])
+                elif hasattr(base_model, 'modality_item_encoders') and k in base_model.modality_item_encoders:
+                    base_model.modality_item_encoders[k] = _PatchedEncoder(
+                        base_model.modality_item_encoders[k], self.intra_mdm[k])
 
         if use_inter:
             self.club_estimators = nn.ModuleDict()
@@ -46,9 +66,17 @@ class BackboneWithDebias(nn.Module):
         result = {}
         for k in modality_features:
             if hasattr(self.base_model, 'modality_encoders') and k in self.base_model.modality_encoders:
-                result[k] = self.base_model.modality_encoders[k](modality_features[k])
+                enc = self.base_model.modality_encoders[k]
+                if isinstance(enc, _PatchedEncoder):
+                    result[k] = enc.original_encoder(modality_features[k])
+                else:
+                    result[k] = enc(modality_features[k])
             elif hasattr(self.base_model, 'modality_item_encoders') and k in self.base_model.modality_item_encoders:
-                result[k] = self.base_model.modality_item_encoders[k](modality_features[k])
+                enc = self.base_model.modality_item_encoders[k]
+                if isinstance(enc, _PatchedEncoder):
+                    result[k] = enc.original_encoder(modality_features[k])
+                else:
+                    result[k] = enc(modality_features[k])
             else:
                 feat = modality_features[k]
                 if feat.shape[1] >= self.embed_dim:
@@ -59,8 +87,12 @@ class BackboneWithDebias(nn.Module):
 
     def compute_loss(self, user_ids, pos_ids, neg_ids, graph_norm, modality_features,
                      inter_norm_u=None, inter_norm_v=None, warmup=False):
-        raw_item_embs = self._get_raw_modality_item_embs(modality_features)
+        base_loss = self.base_model.compute_loss(user_ids, pos_ids, neg_ids, graph_norm, modality_features)
 
+        if not self.use_inter:
+            return base_loss
+
+        raw_item_embs = self._get_raw_modality_item_embs(modality_features)
         Z_I_debiased_dict = {}
         for k in raw_item_embs:
             Z_I_k = raw_item_embs[k]
@@ -70,16 +102,14 @@ class BackboneWithDebias(nn.Module):
                 Z_I_k_debiased = Z_I_k
             Z_I_debiased_dict[k] = Z_I_k_debiased
 
-        base_loss = self.base_model.compute_loss(user_ids, pos_ids, neg_ids, graph_norm, modality_features)
-
         batch_item_ids = torch.unique(torch.cat([pos_ids, neg_ids]))
 
-        if self.use_inter and not warmup:
+        if not warmup:
             mi_terms = {}
             for k in modality_features:
                 M_k = modality_features[k][batch_item_ids]
                 Z_k = Z_I_debiased_dict[k][batch_item_ids]
-                mi_terms[k] = self.club_estimators[k].mi_estimate(M_k, Z_k)
+                mi_terms[k] = self.club_estimators[k].mi_upper_bound(M_k, Z_k)
 
             per_mod_losses = {}
             for k in modality_features:
@@ -95,9 +125,8 @@ class BackboneWithDebias(nn.Module):
             adaptive_loss = torch.pow(torch.sum(torch.pow(loss_values, self.p)), 1.0 / self.p)
             base_loss = base_loss + 0.1 * adaptive_loss
 
-        if self.use_inter:
-            info_loss = self.info_nce(Z_I_debiased_dict, batch_item_ids)
-            base_loss = base_loss + 0.1 * info_loss
+        info_loss = self.info_nce(Z_I_debiased_dict, batch_item_ids)
+        base_loss = base_loss + 0.1 * info_loss
 
         return base_loss
 
@@ -130,7 +159,7 @@ class BackboneWithDebias(nn.Module):
 
     def get_user_item_embs(self, graph_norm, modality_features,
                            interaction_matrix_norm_u=None, interaction_matrix_norm_v=None):
-        return self.get_embs(graph_norm, modality_features)
+        return self.base_model.get_embs(graph_norm, modality_features)
 
 
 def build_backbone_model(backbone_name, dataset, args, device):
@@ -246,6 +275,15 @@ def run_single_config(backbone_name, use_intra, use_inter,
                 user_ids = user_ids.to(device)
                 pos_ids = pos_ids.to(device)
                 neg_ids = neg_ids.to(device)
+                batch_item_ids = torch.unique(torch.cat([pos_ids, neg_ids]))
+
+                if use_inter and club_optimizer is not None:
+                    club_optimizer.zero_grad()
+                    club_nll = model.club_nll_loss(modality_features, batch_item_ids)
+                    club_nll.backward()
+                    torch.nn.utils.clip_grad_norm_(list(club_params), max_norm=5.0)
+                    club_optimizer.step()
+
                 optimizer.zero_grad()
 
                 if use_intra or use_inter:
@@ -260,14 +298,6 @@ def run_single_config(backbone_name, use_intra, use_inter,
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(main_params, max_norm=5.0)
                 optimizer.step()
-
-                if use_inter and club_optimizer is not None:
-                    batch_item_ids = torch.unique(torch.cat([pos_ids, neg_ids]))
-                    club_optimizer.zero_grad()
-                    club_nll = model.club_nll_loss(modality_features, batch_item_ids)
-                    club_nll.backward()
-                    torch.nn.utils.clip_grad_norm_(list(club_params), max_norm=5.0)
-                    club_optimizer.step()
 
             if epoch % args.eval_interval == 0:
                 metrics = evaluate_model(model, dataset, K_list=[10, 20], device=device, mode='val')

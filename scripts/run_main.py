@@ -201,6 +201,23 @@ def train_one_epoch(model, dataset, data_loader, graph_norm, modality_features,
         user_ids = user_ids.to(device)
         pos_ids = pos_ids.to(device)
         neg_ids = neg_ids.to(device)
+        batch_item_ids = torch.unique(torch.cat([pos_ids, neg_ids]))
+
+        needs_club = (model_name in I2MD4FAIR_MODELS or model_name in TRANSFER_MODELS) and club_optimizer is not None
+
+        if needs_club:
+            club_optimizer.zero_grad()
+            if model_name in I2MD4FAIR_MODELS:
+                club_nll = model.club_nll_loss(
+                    modality_features, graph_norm=graph_norm,
+                    interaction_matrix_norm_u=inter_norm_u,
+                    interaction_matrix_norm_v=inter_norm_v,
+                    item_ids=batch_item_ids)
+            else:
+                club_nll = model.club_nll_loss(modality_features, batch_item_ids)
+            club_nll.backward()
+            torch.nn.utils.clip_grad_norm_(club_optimizer.param_groups[0]['params'], max_norm=5.0)
+            club_optimizer.step()
 
         main_optimizer.zero_grad()
 
@@ -222,19 +239,11 @@ def train_one_epoch(model, dataset, data_loader, graph_norm, modality_features,
         else:
             raise ValueError(f"Unknown model category for: {model_name}")
 
-        batch_item_ids = torch.unique(torch.cat([pos_ids, neg_ids]))
         loss.backward()
         torch.nn.utils.clip_grad_norm_(main_optimizer.param_groups[0]['params'], max_norm=5.0)
         main_optimizer.step()
         total_loss += loss.item()
         n_batches += 1
-
-        if (model_name in I2MD4FAIR_MODELS or model_name in TRANSFER_MODELS) and club_optimizer is not None:
-            club_optimizer.zero_grad()
-            club_nll = model.club_nll_loss(modality_features, batch_item_ids)
-            club_nll.backward()
-            torch.nn.utils.clip_grad_norm_(club_optimizer.param_groups[0]['params'], max_norm=5.0)
-            club_optimizer.step()
 
     return total_loss / max(n_batches, 1)
 
@@ -316,9 +325,33 @@ def train_and_eval(model_name, dataset, args, device, n_runs=5):
                 for K in test_metrics[metric_name]:
                     results_all_runs[(metric_name, K)].append(test_metrics[metric_name][K])
 
+            import json
+            output_dir = f'results/{dataset.dataset_name}/{model_name}'
+            os.makedirs(output_dir, exist_ok=True)
+            seed_result = {'seed': run}
+            for m in ['NDCG', 'Recall', 'HR', 'Gini', 'Entropy', 'Coverage', 'REG']:
+                for K in [10, 20]:
+                    if m in test_metrics and K in test_metrics[m]:
+                        seed_result[f'{m}@{K}'] = test_metrics[m][K]
+            with open(os.path.join(output_dir, f'seed_{run}.json'), 'w') as f:
+                json.dump(seed_result, f, indent=2)
+
     avg_results = {}
+    std_results = {}
     for key in results_all_runs:
         avg_results[key] = np.mean(results_all_runs[key])
+        std_results[key] = np.std(results_all_runs[key], ddof=1) if len(results_all_runs[key]) > 1 else 0.0
+
+    import json
+    output_dir = f'results/{dataset.dataset_name}/{model_name}'
+    os.makedirs(output_dir, exist_ok=True)
+    summary = {
+        'mean': {f'{k[0]}@{k[1]}': v for k, v in avg_results.items()},
+        'std': {f'{k[0]}@{k[1]}': v for k, v in std_results.items()},
+        'n_runs': n_runs,
+    }
+    with open(os.path.join(output_dir, 'summary.json'), 'w') as f:
+        json.dump(summary, f, indent=2)
 
     return avg_results
 
@@ -372,11 +405,11 @@ if __name__ == '__main__':
     parser.add_argument('--n_protos', type=int, default=64)
     parser.add_argument('--eps', type=float, default=0.1)
     parser.add_argument('--p_norm', type=float, default=2.0)
-    parser.add_argument('--lam', type=float, default=0.01)
+    parser.add_argument('--lam', '--lambda_ib', type=float, default=0.01, dest='lam')
     parser.add_argument('--tau', type=float, default=0.01)
-    parser.add_argument('--lambda1', type=float, default=0.1)
-    parser.add_argument('--lambda2', type=float, default=0.1)
-    parser.add_argument('--lambda3', type=float, default=1e-4)
+    parser.add_argument('--lambda1', '--lambda_amb', type=float, default=0.1, dest='lambda1')
+    parser.add_argument('--lambda2', '--lambda_cl', type=float, default=0.1, dest='lambda2')
+    parser.add_argument('--lambda3', '--lambda_reg', type=float, default=1e-4, dest='lambda3')
     parser.add_argument('--device', type=str, default='cpu')
     args = parser.parse_args()
 

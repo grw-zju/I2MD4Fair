@@ -116,6 +116,18 @@ def train_single(args, dataset, modality_dims, device, n_runs=3):
                 user_ids = user_ids.to(device)
                 pos_ids = pos_ids.to(device)
                 neg_ids = neg_ids.to(device)
+                batch_item_ids = torch.unique(torch.cat([pos_ids, neg_ids]))
+
+                club_optimizer.zero_grad()
+                club_nll = model.club_nll_loss(
+                    modality_features, graph_norm=graph_norm,
+                    interaction_matrix_norm_u=inter_norm_u,
+                    interaction_matrix_norm_v=inter_norm_v,
+                    item_ids=batch_item_ids)
+                club_nll.backward()
+                torch.nn.utils.clip_grad_norm_(list(club_params), max_norm=5.0)
+                club_optimizer.step()
+
                 optimizer.zero_grad()
                 loss, _, _, _ = model(
                     graph_norm, modality_features, user_ids, pos_ids, neg_ids,
@@ -123,15 +135,9 @@ def train_single(args, dataset, modality_dims, device, n_runs=3):
                     interaction_matrix_norm_v=inter_norm_v,
                     warmup=is_warmup
                 )
-                batch_item_ids = torch.unique(torch.cat([pos_ids, neg_ids]))
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(main_params, max_norm=5.0)
                 optimizer.step()
-                club_optimizer.zero_grad()
-                club_nll = model.club_nll_loss(modality_features, batch_item_ids)
-                club_nll.backward()
-                torch.nn.utils.clip_grad_norm_(list(club_params), max_norm=5.0)
-                club_optimizer.step()
 
             if epoch % args.eval_interval == 0:
                 metrics = evaluate_model(model, dataset, K_list=[10, 20], device=device, mode='val')
@@ -189,15 +195,15 @@ if __name__ == '__main__':
     parser.add_argument('--n_layers', type=int, default=2)
     parser.add_argument('--n_modality_layers', type=int, default=1)
     parser.add_argument('--warmup_epochs', type=int, default=5)
-    parser.add_argument('--n_runs', type=int, default=3)
+    parser.add_argument('--n_runs', type=int, default=5)
     parser.add_argument('--n_protos', type=int, default=64)
     parser.add_argument('--eps', type=float, default=0.1)
     parser.add_argument('--p_norm', type=float, default=2.0)
-    parser.add_argument('--lam', type=float, default=0.01)
+    parser.add_argument('--lam', '--lambda_ib', type=float, default=0.01, dest='lam')
     parser.add_argument('--tau', type=float, default=0.01)
-    parser.add_argument('--lambda1', type=float, default=0.1)
-    parser.add_argument('--lambda2', type=float, default=0.1)
-    parser.add_argument('--lambda3', type=float, default=1e-4)
+    parser.add_argument('--lambda1', '--lambda_amb', type=float, default=0.1, dest='lambda1')
+    parser.add_argument('--lambda2', '--lambda_cl', type=float, default=0.1, dest='lambda2')
+    parser.add_argument('--lambda3', '--lambda_reg', type=float, default=1e-4, dest='lambda3')
     parser.add_argument('--device', type=str, default='cpu')
     args = parser.parse_args()
 
