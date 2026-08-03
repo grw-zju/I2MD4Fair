@@ -81,3 +81,12 @@ python scripts/run_hyperparam.py --dataset baby --device cuda
 # Backbone transferability (Intra-MDM / Inter-MDM on other backbones)
 python scripts/run_transfer.py --dataset baby --device cuda
 ```
+
+### Statistical analysis
+
+After running experiments with multiple seeds, paired t-tests can be performed between two models:
+
+```bash
+# Requires per-seed results from run_main.py (5 seeds by default)
+python scripts/run_statistics.py --results_dir results/ --dataset baby --our_model I2MD4Fair --comparator MMSSL
+```
