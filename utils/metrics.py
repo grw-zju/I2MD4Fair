@@ -154,11 +154,23 @@ def evaluate_model(model, dataset, device='cpu', K_list=[10, 20], mode='test', e
 
         topk_at_k = topk_index_matrix[:, :K]
         num_count = Counter(list(topk_at_k.reshape(-1)))
+
+        exposure_counts = np.zeros(n_items, dtype=np.float64)
+        for item_id, count in num_count.items():
+            if item_id < n_items:
+                exposure_counts[item_id] = count
+        total_exposure = exposure_counts.sum()
+        if n_items <= 1 or total_exposure == 0:
+            gini = 0.0
+        else:
+            p_sorted = np.sort(exposure_counts / total_exposure)
+            indices = np.arange(1, n_items + 1, dtype=np.float64)
+            gini = np.sum((2 * indices - n_items - 1) * p_sorted) / (n_items - 1)
+
         num_list = np.array(list(num_count.values()), dtype=np.float64)
         p_list = num_list / max(num_list.sum(), 1.0)
 
         entropy = -np.sum(np.log(p_list + 1e-10) * p_list)
-        gini = cal_gini(num_list)
         coverage = len(num_count) / n_items
 
         metrics['Gini'][K] = round(gini, 4)
