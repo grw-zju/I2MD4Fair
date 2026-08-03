@@ -205,6 +205,11 @@ def train_one_epoch(model, dataset, data_loader, graph_norm, modality_features,
 
         needs_club = (model_name in I2MD4FAIR_MODELS or model_name in TRANSFER_MODELS) and club_optimizer is not None
 
+        Z_I_full_dict = None
+        if model_name in I2MD4FAIR_MODELS:
+            Z_I_full_dict = model._compute_modality_reprs(
+                modality_features, inter_norm_u, inter_norm_v, detach=True)
+
         if needs_club:
             club_optimizer.zero_grad()
             if model_name in I2MD4FAIR_MODELS:
@@ -212,7 +217,7 @@ def train_one_epoch(model, dataset, data_loader, graph_norm, modality_features,
                     modality_features, graph_norm=graph_norm,
                     interaction_matrix_norm_u=inter_norm_u,
                     interaction_matrix_norm_v=inter_norm_v,
-                    item_ids=batch_item_ids)
+                    item_ids=batch_item_ids, Z_I_full_dict=Z_I_full_dict)
             else:
                 club_nll = model.club_nll_loss(modality_features, batch_item_ids)
             club_nll.backward()
@@ -225,7 +230,7 @@ def train_one_epoch(model, dataset, data_loader, graph_norm, modality_features,
             loss, _, _, _ = model(graph_norm, modality_features, user_ids, pos_ids, neg_ids,
                                  interaction_matrix_norm_u=inter_norm_u,
                                  interaction_matrix_norm_v=inter_norm_v,
-                                 warmup=is_warmup)
+                                 warmup=is_warmup, Z_I_full_dict=Z_I_full_dict)
         elif model_name in TRANSFER_MODELS:
             loss = model.compute_loss(user_ids, pos_ids, neg_ids, graph_norm, modality_features,
                                       inter_norm_u=inter_norm_u, inter_norm_v=inter_norm_v,

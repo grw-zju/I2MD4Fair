@@ -316,7 +316,7 @@ class I2MD4Fair(nn.Module):
 
     def forward(self, graph_norm, modality_features, user_ids, item_pos_ids, item_neg_ids,
                 interaction_matrix_norm_u=None, interaction_matrix_norm_v=None,
-                warmup=False):
+                warmup=False, Z_I_full_dict=None):
         X_U_final, X_V_final = self._id_message_passing(graph_norm)
 
         batch_item_ids = torch.unique(torch.cat([item_pos_ids, item_neg_ids]))
@@ -325,23 +325,18 @@ class I2MD4Fair(nn.Module):
         batch_user_ids = torch.unique(user_ids)
         user_local = torch.searchsorted(batch_user_ids, user_ids)
 
+        if Z_I_full_dict is None:
+            Z_I_full_dict = self._compute_modality_reprs(
+                modality_features, interaction_matrix_norm_u, interaction_matrix_norm_v,
+                detach=False)
+
         Z_I_debiased_dict = {}
         Z_U_dict = {}
         Z_I_dict = {}
         modality_inputs = {}
 
         for k in modality_features:
-            M_k = modality_features[k]
-            E_I_k_full = self.modality_item_encoders[k](M_k)
-
-            if interaction_matrix_norm_u is not None and interaction_matrix_norm_v is not None:
-                Z_I_k_full = self._modality_init_propagation(
-                    interaction_matrix_norm_u, interaction_matrix_norm_v, E_I_k_full
-                )
-            else:
-                Z_I_k_full = E_I_k_full
-
-            Z_I_k_batch = Z_I_k_full[batch_item_ids]
+            Z_I_k_batch = Z_I_full_dict[k][batch_item_ids]
             Z_I_k_debiased_batch, gamma_k = self.intra_mdm[k](Z_I_k_batch)
 
             Z_U_k_batch, _ = self._build_batch_local_users(
@@ -351,7 +346,7 @@ class I2MD4Fair(nn.Module):
             Z_I_debiased_dict[k] = Z_I_k_debiased_batch
             Z_U_dict[k] = Z_U_k_batch
             Z_I_dict[k] = Z_I_k_debiased_batch
-            modality_inputs[k] = M_k[batch_item_ids]
+            modality_inputs[k] = modality_features[k][batch_item_ids]
 
         mi_terms = self.inter_mdm.compute_mi(
             modality_inputs,
@@ -360,19 +355,17 @@ class I2MD4Fair(nn.Module):
 
         info_nce_loss = self.info_nce(Z_I_debiased_dict)
 
-        hat_X_U = X_U_final
-        hat_X_V = X_V_final
+        hat_X_U_batch = X_U_final[user_ids]
+        hat_X_V_batch_pos = X_V_final[item_pos_ids]
+        hat_X_V_batch_neg = X_V_final[item_neg_ids]
         for k in Z_U_dict:
-            Z_U_full = torch.zeros(self.n_users, Z_U_dict[k].shape[1], device=X_U_final.device)
-            Z_U_full[batch_user_ids] = Z_U_dict[k]
-            hat_X_U = torch.cat([hat_X_U, Z_U_full], dim=1)
-            Z_I_full = torch.zeros(self.n_items, Z_I_dict[k].shape[1], device=X_V_final.device)
-            Z_I_full[batch_item_ids] = Z_I_dict[k]
-            hat_X_V = torch.cat([hat_X_V, Z_I_full], dim=1)
+            hat_X_U_batch = torch.cat([hat_X_U_batch, Z_U_dict[k][user_local]], dim=1)
+            hat_X_V_batch_pos = torch.cat([hat_X_V_batch_pos, Z_I_dict[k][item_pos_local]], dim=1)
+            hat_X_V_batch_neg = torch.cat([hat_X_V_batch_neg, Z_I_dict[k][item_neg_local]], dim=1)
 
-        u_emb = hat_X_U[user_ids]
-        pos_emb = hat_X_V[item_pos_ids]
-        neg_emb = hat_X_V[item_neg_ids]
+        u_emb = hat_X_U_batch
+        pos_emb = hat_X_V_batch_pos
+        neg_emb = hat_X_V_batch_neg
 
         pos_scores = (u_emb * pos_emb).sum(dim=1)
         neg_scores = (u_emb * neg_emb).sum(dim=1)
@@ -420,26 +413,52 @@ class I2MD4Fair(nn.Module):
             reg = reg + intra.soft_clustering.prototypes.pow(2).sum()
         return reg / (2.0 * max(user_ids.numel(), 1))
 
-    def club_nll_loss(self, modality_features, graph_norm=None,
-                      interaction_matrix_norm_u=None, interaction_matrix_norm_v=None,
-                      item_ids=None):
-        with torch.no_grad():
-            Z_I_debiased_dict = {}
-            modality_inputs = {}
+    def _compute_modality_reprs(self, modality_features,
+                                interaction_matrix_norm_u=None,
+                                interaction_matrix_norm_v=None,
+                                item_ids=None, detach=False):
+        ctx = torch.no_grad() if detach else torch.enable_grad()
+        with ctx:
+            Z_I_full_dict = {}
             for k in modality_features:
                 M_k = modality_features[k]
                 E_I_k = self.modality_item_encoders[k](M_k)
                 if interaction_matrix_norm_u is not None and interaction_matrix_norm_v is not None:
                     Z_I_k = self._modality_init_propagation(
-                        interaction_matrix_norm_u, interaction_matrix_norm_v, E_I_k
-                    )
+                        interaction_matrix_norm_u, interaction_matrix_norm_v, E_I_k)
                 else:
                     Z_I_k = E_I_k
-                Z_I_k_debiased, _ = self.intra_mdm[k](Z_I_k)
+                Z_I_full_dict[k] = Z_I_k
+        return Z_I_full_dict
+
+    def _intra_mdm_batch(self, Z_I_full_dict, item_ids):
+        Z_I_debiased_dict = {}
+        modality_inputs_batch = {}
+        for k in Z_I_full_dict:
+            Z_I_k_batch = Z_I_full_dict[k][item_ids]
+            Z_I_k_debiased, _ = self.intra_mdm[k](Z_I_k_batch)
+            Z_I_debiased_dict[k] = Z_I_k_debiased
+        return Z_I_debiased_dict
+
+    def club_nll_loss(self, modality_features, graph_norm=None,
+                      interaction_matrix_norm_u=None, interaction_matrix_norm_v=None,
+                      item_ids=None, Z_I_full_dict=None):
+        if Z_I_full_dict is None:
+            Z_I_full_dict = self._compute_modality_reprs(
+                modality_features, interaction_matrix_norm_u, interaction_matrix_norm_v,
+                detach=True)
+        with torch.no_grad():
+            Z_I_debiased_dict = {}
+            modality_inputs = {}
+            for k in modality_features:
+                M_k = modality_features[k]
                 if item_ids is not None:
-                    Z_I_debiased_dict[k] = Z_I_k_debiased[item_ids].detach()
+                    Z_I_k_batch = Z_I_full_dict[k][item_ids]
+                    Z_I_k_debiased, _ = self.intra_mdm[k](Z_I_k_batch)
+                    Z_I_debiased_dict[k] = Z_I_k_debiased.detach()
                     modality_inputs[k] = M_k[item_ids]
                 else:
+                    Z_I_k_debiased, _ = self.intra_mdm[k](Z_I_full_dict[k])
                     Z_I_debiased_dict[k] = Z_I_k_debiased.detach()
                     modality_inputs[k] = M_k
         return self.inter_mdm.club_nll(modality_inputs, Z_I_debiased_dict)
