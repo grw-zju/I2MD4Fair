@@ -19,8 +19,8 @@ class SpAdjDropEdge(nn.Module):
     def forward(self, adj):
         if not adj.is_sparse or self.keep_rate >= 1.0:
             return adj
-        vals = adj._values()
-        idxs = adj._indices()
+        vals = adj.values()
+        idxs = adj.indices()
         edge_num = vals.size(0)
         mask = ((torch.rand(edge_num, device=adj.device) + self.keep_rate).floor()).bool()
         new_vals = vals[mask] / self.keep_rate
@@ -155,9 +155,10 @@ class GaussianDiffusion(nn.Module):
         x_t = self.q_sample(x_start, t, noise)
         model_output = model(x_t, t)
         mse = ((x_start - model_output) ** 2).mean(dim=list(range(1, len(x_start.shape))))
-        snr = self.alphas_cumprod.to(x_start.device)[t] / (1 - self.alphas_cumprod.to(x_start.device)[t])
-        weight = torch.where(t == 0, torch.ones_like(snr), snr - self.alphas_cumprod.to(x_start.device)[t.clamp(min=1) - 1] /
-                             (1 - self.alphas_cumprod.to(x_start.device)[t.clamp(min=1) - 1]))
+        snr = self.alphas_cumprod.to(x_start.device).float()[t] / (1 - self.alphas_cumprod.to(x_start.device).float()[t])
+        t_prev = (t - 1).clamp(min=0)
+        prev_snr = self.alphas_cumprod.to(x_start.device).float()[t_prev] / (1 - self.alphas_cumprod.to(x_start.device).float()[t_prev])
+        weight = torch.where(t == 0, torch.ones_like(snr), snr - prev_snr)
         diff_loss = weight * mse
         usr_model = model_output @ model_feats
         usr_id = x_start @ itm_embeds
@@ -197,7 +198,7 @@ class DiffMM(nn.Module):
         for k, dim in modality_dims.items():
             self.modality_trans[k] = nn.Linear(dim, embed_dim)
 
-        self.modal_weight = nn.Parameter(torch.Tensor([0.5, 0.5][:len(modality_dims)]))
+        self.modal_weight = nn.Parameter(torch.ones(len(modality_dims)) / len(modality_dims))
         self.softmax = nn.Softmax(dim=0)
         self.leakyrelu = nn.LeakyReLU(0.2)
 
@@ -213,11 +214,18 @@ class DiffMM(nn.Module):
         self._ui_adj = None
         self._train_inter = None
 
+    def set_train_interactions(self, train_data, n_users, n_items):
+        mat = torch.zeros(n_users, n_items, dtype=torch.float32)
+        for u, i in train_data:
+            if i < n_items:
+                mat[u, i] = 1.0
+        self._train_inter = mat
+
     def set_precomputed_adj(self, adj_matrices):
         if adj_matrices is not None:
             image_adj = adj_matrices.get('image_adj', None)
             text_adj = adj_matrices.get('text_adj', None)
-            if image_adj is not None:
+            if image_adj is not None and text_adj is not None:
                 self._modality_adjs = {'visual': image_adj, 'textual': text_adj}
 
     def _normalize_adj(self, mat):

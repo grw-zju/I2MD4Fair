@@ -25,9 +25,12 @@ class BPRDataLoader:
         neg_ids = np.random.randint(0, self.n_items, size=self.batch_size, dtype=np.int64)
 
         invalid = self._invalid_negative_mask(user_ids, neg_ids)
-        while invalid.any():
+        max_retries = 50
+        retry_count = 0
+        while invalid.any() and retry_count < max_retries:
             neg_ids[invalid] = np.random.randint(0, self.n_items, size=int(invalid.sum()), dtype=np.int64)
             invalid = self._invalid_negative_mask(user_ids, neg_ids, invalid)
+            retry_count += 1
 
         return torch.from_numpy(user_ids.copy()).long(), torch.from_numpy(pos_ids.copy()).long(), torch.from_numpy(neg_ids).long()
 

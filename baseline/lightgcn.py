@@ -61,6 +61,5 @@ class LightGCNWithModalities(LightGCN):
         hat_X_U = user_embs
         hat_X_V = item_embs
         for k in modality_embs:
-            hat_X_U = torch.cat([hat_X_U, user_embs], dim=1)
             hat_X_V = torch.cat([hat_X_V, modality_embs[k]], dim=1)
         return hat_X_U, hat_X_V

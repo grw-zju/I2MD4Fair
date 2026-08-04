@@ -44,10 +44,10 @@ class FairDualWrapper(nn.Module):
         return base_loss
 
     def _compute_item_groups(self, dataset):
-        item_freq = np.zeros(self.n_items, dtype=np.int64)
-        for u, i in dataset.train_data:
-            if i < self.n_items:
-                item_freq[i] += 1
+        if dataset.train_data.size:
+            item_freq = np.bincount(dataset.train_data[:, 1], minlength=self.n_items).astype(np.int64)[:self.n_items]
+        else:
+            item_freq = np.zeros(self.n_items, dtype=np.int64)
 
         sorted_indices = np.argsort(-item_freq, kind='stable')
         group_size = self.n_items // self.n_groups
@@ -74,12 +74,13 @@ class FairDualWrapper(nn.Module):
         user_embs, item_embs = self._full_sort_cache
         scores = user_embs @ item_embs.T
 
-        train_mask = torch.ones(self.n_users, self.n_items, device=device)
-        for u in range(self.n_users):
-            interacted = dataset.train_user_item_dict.get(u, set())
-            for v in interacted:
-                if v < self.n_items:
-                    train_mask[u, v] = 0
+        if dataset.train_data.size:
+            train_rows = torch.LongTensor(dataset.train_data[:, 0])
+            train_cols = torch.LongTensor(dataset.train_data[:, 1])
+            train_mask = torch.ones(self.n_users, self.n_items, device=device)
+            train_mask[train_rows, train_cols] = 0
+        else:
+            train_mask = torch.ones(self.n_users, self.n_items, device=device)
 
         scores = scores * train_mask - 1e10 * (1 - train_mask)
         _, topk_idx = torch.topk(scores, self.topk, dim=1)
@@ -94,7 +95,6 @@ class FairDualWrapper(nn.Module):
         max_exposure = group_exposure.max()
 
         if max_exposure > min_exposure:
-            group_exposure_norm = group_exposure / max_exposure
             target_weight = min_exposure / (group_exposure + 1e-8)
             target_weight = target_weight / target_weight.mean()
 
@@ -102,7 +102,7 @@ class FairDualWrapper(nn.Module):
                 self._group_mu = torch.ones(self.n_groups, device=device)
 
             grad_mu = target_weight - self._group_mu
-            self._group_mu = self.alpha * self._group_mu + (1 - self.alpha) * (self._group_mu + self.eta * grad_mu)
+            self._group_mu = self._group_mu + (1 - self.alpha) * self.eta * grad_mu
             self._group_mu = F.softplus(self._group_mu)
 
     def get_embs(self, *args):

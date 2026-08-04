@@ -4,6 +4,7 @@ import pickle
 import numpy as np
 import scipy.sparse as sp
 import torch
+import torch.nn.functional as F
 from collections import defaultdict
 
 
@@ -179,9 +180,9 @@ class DAMRSDataset:
                     test_pairs.append((u, v))
                     self.test_user_item_dict[u].add(v)
 
-        self.train_data = np.array(train_pairs, dtype=np.int64)
-        self.val_data = np.array(val_pairs, dtype=np.int64)
-        self.test_data = np.array(test_pairs, dtype=np.int64)
+        self.train_data = np.array(train_pairs, dtype=np.int64).reshape(-1, 2)
+        self.val_data = np.array(val_pairs, dtype=np.int64).reshape(-1, 2)
+        self.test_data = np.array(test_pairs, dtype=np.int64).reshape(-1, 2)
         self.n_users = max(all_u) + 1 if all_u else 0
 
     def _max_inter_item_id(self):
@@ -261,6 +262,8 @@ class DAMRSDataset:
             'val_size': int(len(self.val_data)),
             'test_size': int(len(self.test_data)),
             'interaction_nnz': int(self.interaction_matrix.nnz),
+            'visual_features_shape': tuple(self.visual_features.shape),
+            'textual_features_shape': tuple(self.textual_features.shape),
         }
 
     def _load_graph_cache(self, ds_dir):
@@ -294,9 +297,13 @@ class DAMRSDataset:
         torch.save(cache, cache_path)
 
     def get_modality_features(self):
+        visual = torch.FloatTensor(self.visual_features)
+        textual = torch.FloatTensor(self.textual_features)
+        visual = F.normalize(visual, dim=1)
+        textual = F.normalize(textual, dim=1)
         return {
-            'visual': torch.FloatTensor(self.visual_features),
-            'textual': torch.FloatTensor(self.textual_features),
+            'visual': visual,
+            'textual': textual,
         }
 
     def get_modality_features_dim(self):

@@ -45,7 +45,7 @@ class MENTOR(nn.Module):
         for _ in range(self.n_layers):
             all_embs = torch.sparse.mm(graph_norm, all_embs) if graph_norm.is_sparse else graph_norm @ all_embs
             if perturbed:
-                noise = F.normalize(torch.rand_like(all_embs), dim=-1)
+                noise = F.normalize(torch.randn_like(all_embs), dim=-1)
                 all_embs = all_embs + torch.sign(all_embs) * noise * 0.1
             embs_list.append(all_embs)
         final = torch.mean(torch.stack(embs_list, dim=1), dim=1)

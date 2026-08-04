@@ -11,6 +11,8 @@ external/
 *.zip
 *.tar.gz
 *.pdf
+Response Letter.docx
+intro_*.png
 
 # Data is distributed separately via Drive.
 data/Amazon/
@@ -25,8 +27,6 @@ data/processed/
 # Demo dataset is tracked in-repo (small, for quick testing)
 !data/damrs/demo/
 !data/damrs/demo/**
-data/damrs/demo/_*.pt
-data/damrs/demo/_*.pkl
 
 # Generated outputs
 results/
@@ -37,3 +37,8 @@ checkpoints/
 
 # Demo dataset files are tracked despite *.pt rule
 !data/damrs/demo/*.pt
+
+# Demo intermediate/cache files (must NOT be tracked)
+data/damrs/demo/_*
+md_rq3/
+md_rq4/

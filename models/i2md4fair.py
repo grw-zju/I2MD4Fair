@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 
 class SinkhornOT(nn.Module):
@@ -115,7 +114,7 @@ class CLUBEstimator(nn.Module):
     def mi_upper_bound(self, x, z):
         B = z.shape[0]
         if B < 2:
-            return torch.tensor(0.0, device=z.device, requires_grad=True)
+            return torch.tensor(0.0, device=z.device)
         with torch.no_grad():
             mu, logvar = self.forward(x)
         log_pos = self.log_prob(z, mu, logvar).sum(dim=-1)
@@ -164,7 +163,7 @@ class InterMDM(nn.Module):
         return mi_terms
 
     def adaptive_loss(self, per_modality_losses):
-        loss_values = torch.stack([l for l in per_modality_losses.values()])
+        loss_values = torch.stack([l for l in per_modality_losses.values()]).clamp_min(1e-12)
         p_norm = torch.pow(torch.sum(torch.pow(loss_values, self.p)), 1.0 / self.p)
         return p_norm
 
@@ -269,6 +268,7 @@ class I2MD4Fair(nn.Module):
 
     def _modality_init_propagation(self, inter_norm_u, inter_norm_v, E_I_init):
         E_I = E_I_init
+        embs_list = [E_I]
         for _ in range(self.n_modality_layers):
             if inter_norm_u.is_sparse:
                 E_U = torch.sparse.mm(inter_norm_u, E_I)
@@ -278,11 +278,8 @@ class I2MD4Fair(nn.Module):
                 E_I = torch.sparse.mm(inter_norm_v, E_U)
             else:
                 E_I = inter_norm_v @ E_U
-        if self.n_modality_layers == 0:
-            Z_I = E_I_init
-        else:
-            Z_I = (E_I_init + E_I) / (self.n_modality_layers + 1)
-        return Z_I
+            embs_list.append(E_I)
+        return torch.mean(torch.stack(embs_list, dim=1), dim=1)
 
     def _reconstruct_modality_user(self, inter_norm_u, Z_I_debiased):
         if inter_norm_u.is_sparse:
@@ -394,7 +391,7 @@ class I2MD4Fair(nn.Module):
     def _l2_reg(self):
         reg = 0.0
         for param in self.parameters():
-            reg += torch.norm(param, 2) ** 2
+            reg = reg + param.pow(2).sum()
         return reg / 2
 
     def _batch_l2_reg(self, user_ids, pos_ids, neg_ids):
@@ -415,23 +412,30 @@ class I2MD4Fair(nn.Module):
                                 interaction_matrix_norm_u=None,
                                 interaction_matrix_norm_v=None,
                                 item_ids=None, detach=False):
-        ctx = torch.no_grad() if detach else torch.enable_grad()
-        with ctx:
-            Z_I_full_dict = {}
-            for k in modality_features:
-                M_k = modality_features[k]
-                E_I_k = self.modality_item_encoders[k](M_k)
-                if interaction_matrix_norm_u is not None and interaction_matrix_norm_v is not None:
-                    Z_I_k = self._modality_init_propagation(
-                        interaction_matrix_norm_u, interaction_matrix_norm_v, E_I_k)
-                else:
-                    Z_I_k = E_I_k
-                Z_I_full_dict[k] = Z_I_k
+        if detach:
+            with torch.no_grad():
+                return self._compute_modality_reprs_inner(
+                    modality_features, interaction_matrix_norm_u, interaction_matrix_norm_v)
+        return self._compute_modality_reprs_inner(
+            modality_features, interaction_matrix_norm_u, interaction_matrix_norm_v)
+
+    def _compute_modality_reprs_inner(self, modality_features,
+                                       interaction_matrix_norm_u=None,
+                                       interaction_matrix_norm_v=None):
+        Z_I_full_dict = {}
+        for k in modality_features:
+            M_k = modality_features[k]
+            E_I_k = self.modality_item_encoders[k](M_k)
+            if interaction_matrix_norm_u is not None and interaction_matrix_norm_v is not None:
+                Z_I_k = self._modality_init_propagation(
+                    interaction_matrix_norm_u, interaction_matrix_norm_v, E_I_k)
+            else:
+                Z_I_k = E_I_k
+            Z_I_full_dict[k] = Z_I_k
         return Z_I_full_dict
 
     def _intra_mdm_batch(self, Z_I_full_dict, item_ids):
         Z_I_debiased_dict = {}
-        modality_inputs_batch = {}
         for k in Z_I_full_dict:
             Z_I_k_batch = Z_I_full_dict[k][item_ids]
             Z_I_k_debiased, _ = self.intra_mdm[k](Z_I_k_batch)

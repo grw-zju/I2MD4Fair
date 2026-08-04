@@ -131,6 +131,7 @@ class AblationModel(nn.Module):
 
     def _modality_init_propagation(self, inter_norm_u, inter_norm_v, E_I_init):
         E_I = E_I_init
+        embs_list = [E_I]
         for _ in range(self.n_modality_layers):
             if inter_norm_u.is_sparse:
                 E_U = torch.sparse.mm(inter_norm_u, E_I)
@@ -140,9 +141,8 @@ class AblationModel(nn.Module):
                 E_I = torch.sparse.mm(inter_norm_v, E_U)
             else:
                 E_I = inter_norm_v @ E_U
-        if self.n_modality_layers == 0:
-            return E_I_init
-        return (E_I_init + E_I) / (self.n_modality_layers + 1)
+            embs_list.append(E_I)
+        return torch.mean(torch.stack(embs_list, dim=1), dim=1)
 
     def _reconstruct_modality_user(self, inter_norm_u, Z_I_debiased):
         if inter_norm_u.is_sparse:
@@ -171,7 +171,7 @@ class AblationModel(nn.Module):
             if self.use_intra:
                 Z_I_k_debiased, _ = self.intra_mdm[k](Z_I_k)
             elif self.use_hgcn and not self.use_soft_proto:
-                one_hot = lloyd_kmeans(Z_I_k, self.prototypes_abl[k].shape[0] if hasattr(self, 'prototypes_abl') else 64)
+                one_hot = lloyd_kmeans(Z_I_k, 64)
                 incidence = Z_I_k.shape[0] * one_hot
                 Z_I_k_debiased = self.prop_layers[k](Z_I_k, incidence)
             elif self.use_soft_proto:
@@ -231,7 +231,7 @@ class AblationModel(nn.Module):
             per_modality_losses[k] = total_k
 
         if self.use_adaptive:
-            loss_values = torch.stack([l for l in per_modality_losses.values()])
+            loss_values = torch.stack([l for l in per_modality_losses.values()]).clamp_min(1e-12)
             adaptive_loss = torch.pow(torch.sum(torch.pow(loss_values, self.p_norm)), 1.0 / self.p_norm)
         elif self.use_avg_fusion:
             adaptive_loss = sum(per_modality_losses.values()) / len(per_modality_losses)
@@ -391,18 +391,11 @@ def run_ablation_config(config, dataset, modality_dims, args, device, n_runs=5):
                     club_optimizer.step()
 
                 main_optimizer.zero_grad()
-                if config == 'full':
-                    loss, _, _, _ = model(
-                        graph_norm, modality_features, user_ids, pos_ids, neg_ids,
-                        interaction_matrix_norm_u=inter_norm_u,
-                        interaction_matrix_norm_v=inter_norm_v,
-                        warmup=is_warmup)
-                else:
-                    loss, _, _, _ = model(
-                        graph_norm, modality_features, user_ids, pos_ids, neg_ids,
-                        interaction_matrix_norm_u=inter_norm_u,
-                        interaction_matrix_norm_v=inter_norm_v,
-                        warmup=is_warmup)
+                loss, _, _, _ = model(
+                    graph_norm, modality_features, user_ids, pos_ids, neg_ids,
+                    interaction_matrix_norm_u=inter_norm_u,
+                    interaction_matrix_norm_v=inter_norm_v,
+                    warmup=is_warmup)
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(main_params, max_norm=5.0)
@@ -457,7 +450,7 @@ def build_ablation_model(config, dataset, modality_dims, args, device):
         'intra_only': dict(use_intra=True),
         'ib_only': dict(use_inter=True, use_ib=True),
         'ib_avg_fusion': dict(use_inter=True, use_ib=True, use_avg_fusion=True),
-        'adaptive_pnorm': dict(use_inter=True, use_adaptive=True),
+        'adaptive_pnorm': dict(use_inter=True, use_ib=True, use_adaptive=True),
         'inter_only': dict(use_inter=True, use_ib=True, use_adaptive=True),
     }
 

@@ -303,6 +303,9 @@ def train_and_eval(model_name, dataset, args, device, n_runs=5):
                                    model_name, inter_norm_u, inter_norm_v,
                                    epoch=epoch, warmup_epochs=args.warmup_epochs)
 
+            if model_name in FAIRDUAL_MODELS and hasattr(model, 'update_dual_variables'):
+                model.update_dual_variables(dataset, device, epoch, update_every=5)
+
             if epoch % args.eval_interval == 0:
                 metrics = evaluate_model(model, dataset, device=device, K_list=[10, 20], mode='val')
                 recall10 = metrics['Recall'][10]

@@ -38,10 +38,10 @@ class DPRWrapper(nn.Module):
         return base_loss
 
     def _compute_group_weights(self, dataset):
-        item_freq = np.zeros(self.n_items, dtype=np.float32)
-        for u, i in dataset.train_data:
-            if i < self.n_items:
-                item_freq[i] += 1.0
+        if dataset.train_data.size:
+            item_freq = np.bincount(dataset.train_data[:, 1], minlength=self.n_items).astype(np.float32)[:self.n_items]
+        else:
+            item_freq = np.zeros(self.n_items, dtype=np.float32)
 
         sorted_indices = np.argsort(-item_freq)
         group_size = self.n_items // self.n_groups
@@ -74,20 +74,7 @@ class DPRWrapper(nn.Module):
         if hasattr(self.base_model, 'prepare_full_sort'):
             self.base_model.prepare_full_sort(dataset, device)
 
-        if hasattr(self.base_model, 'get_user_item_embs'):
-            kwargs = {}
-            if hasattr(self.base_model, 'get_modality_norm_matrices'):
-                pass
-            user_embs, item_embs = self.base_model.get_user_item_embs(
-                dataset.get_norm_graph().to(device),
-                dataset.get_modality_features_to_device(device),
-                **kwargs
-            ) if hasattr(dataset, 'get_modality_features_to_device') else \
-                self._get_embs_safe(dataset, device)
-        else:
-            user_embs, item_embs = self._get_embs_safe(dataset, device)
-
-        self._full_sort_cache = (user_embs, item_embs)
+        self._full_sort_cache = self._get_embs_safe(dataset, device)
 
     def _get_embs_safe(self, dataset, device):
         graph_norm = dataset.get_norm_graph().to(device)

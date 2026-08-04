@@ -28,44 +28,58 @@ def hyperparameter_experiment(args, device):
 
     print("\n=== Lambda1 (Adaptive Modality-Balanced Loss) ===")
     results['lambda1'] = {}
+    orig_lambda1 = args.lambda1
     for lam1 in lambda1_values:
         args.lambda1 = lam1
         avg = train_single(args, dataset, modality_dims, device, n_runs=args.n_runs)
         results['lambda1'][lam1] = avg
         print(f"lambda1={lam1}: N@10={avg.get(('NDCG',10),0):.4f}, R@10={avg.get(('Recall',10),0):.4f}, "
               f"C@10={avg.get(('Coverage',10),0):.4f}")
+    args.lambda1 = orig_lambda1
 
     print("\n=== Lambda2 (Cross-modality Alignment Loss) ===")
     results['lambda2'] = {}
+    orig_lambda2 = args.lambda2
     for lam2 in lambda2_values:
         args.lambda2 = lam2
         avg = train_single(args, dataset, modality_dims, device, n_runs=args.n_runs)
         results['lambda2'][lam2] = avg
         print(f"lambda2={lam2}: N@10={avg.get(('NDCG',10),0):.4f}, R@10={avg.get(('Recall',10),0):.4f}, "
               f"C@10={avg.get(('Coverage',10),0):.4f}")
+    args.lambda2 = orig_lambda2
 
     print("\n=== Lambda (Modality Info Regularization) ===")
     results['lam'] = {}
+    orig_lam = args.lam
     for lam_val in lam_values:
         args.lam = lam_val
         avg = train_single(args, dataset, modality_dims, device, n_runs=args.n_runs)
         results['lam'][lam_val] = avg
         print(f"lambda={lam_val}: N@10={avg.get(('NDCG',10),0):.4f}, R@10={avg.get(('Recall',10),0):.4f}, "
               f"C@10={avg.get(('Coverage',10),0):.4f}")
+    args.lam = orig_lam
 
     print("\n=== p-norm (Adaptive Fusion Order) ===")
     results['p'] = {}
+    orig_p = args.p_norm
     for p_val in p_values:
         args.p_norm = p_val
         avg = train_single(args, dataset, modality_dims, device, n_runs=args.n_runs)
         results['p'][p_val] = avg
+        print(f"p={p_val}: N@10={avg.get(('NDCG',10),0):.4f}, R@10={avg.get(('Recall',10),0):.4f}, "
+              f"C@10={avg.get(('Coverage',10),0):.4f}")
+    args.p_norm = orig_p
 
     print("\n=== T (Number of Prototypes) ===")
     results['T'] = {}
+    orig_T = args.n_protos
     for T_val in T_values:
         args.n_protos = T_val
         avg = train_single(args, dataset, modality_dims, device, n_runs=args.n_runs)
         results['T'][T_val] = avg
+        print(f"T={T_val}: N@10={avg.get(('NDCG',10),0):.4f}, R@10={avg.get(('Recall',10),0):.4f}, "
+              f"C@10={avg.get(('Coverage',10),0):.4f}")
+    args.n_protos = orig_T
 
     save_results(results, args.dataset)
     return results

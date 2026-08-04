@@ -32,7 +32,8 @@ class _PatchedEncoder(nn.Module):
 class BackboneWithDebias(nn.Module):
     def __init__(self, base_model, modality_dims, embed_dim,
                  use_intra=False, use_inter=False,
-                 n_protos=64, eps=0.1, p=2, lam=0.01, tau=0.01):
+                 n_protos=64, eps=0.1, p=2, lam=0.01, tau=0.01,
+                 lambda1=0.1, lambda2=0.1):
         super().__init__()
         self.base_model = base_model
         self.n_users = base_model.n_users
@@ -42,6 +43,8 @@ class BackboneWithDebias(nn.Module):
         self.use_inter = use_inter
         self.lam = lam
         self.p = p
+        self.lambda1 = lambda1
+        self.lambda2 = lambda2
 
         if use_intra:
             self.intra_mdm = nn.ModuleDict()
@@ -54,6 +57,9 @@ class BackboneWithDebias(nn.Module):
                 elif hasattr(base_model, 'modality_item_encoders') and k in base_model.modality_item_encoders:
                     base_model.modality_item_encoders[k] = _PatchedEncoder(
                         base_model.modality_item_encoders[k], self.intra_mdm[k])
+                elif hasattr(base_model, 'modality_trans') and k in base_model.modality_trans:
+                    base_model.modality_trans[k] = _PatchedEncoder(
+                        base_model.modality_trans[k], self.intra_mdm[k])
 
         if use_inter:
             self.club_estimators = nn.ModuleDict()
@@ -73,6 +79,12 @@ class BackboneWithDebias(nn.Module):
                     result[k] = enc(modality_features[k])
             elif hasattr(self.base_model, 'modality_item_encoders') and k in self.base_model.modality_item_encoders:
                 enc = self.base_model.modality_item_encoders[k]
+                if isinstance(enc, _PatchedEncoder):
+                    result[k] = enc.original_encoder(modality_features[k])
+                else:
+                    result[k] = enc(modality_features[k])
+            elif hasattr(self.base_model, 'modality_trans') and k in self.base_model.modality_trans:
+                enc = self.base_model.modality_trans[k]
                 if isinstance(enc, _PatchedEncoder):
                     result[k] = enc.original_encoder(modality_features[k])
                 else:
@@ -121,12 +133,12 @@ class BackboneWithDebias(nn.Module):
                 rec_k = -F.logsigmoid(pos_s - neg_s).mean()
                 per_mod_losses[k] = rec_k + self.lam * mi_terms[k]
 
-            loss_values = torch.stack([l for l in per_mod_losses.values()])
+            loss_values = torch.stack([l for l in per_mod_losses.values()]).clamp_min(1e-12)
             adaptive_loss = torch.pow(torch.sum(torch.pow(loss_values, self.p)), 1.0 / self.p)
-            base_loss = base_loss + 0.1 * adaptive_loss
+            base_loss = base_loss + self.lambda1 * adaptive_loss
 
         info_loss = self.info_nce(Z_I_debiased_dict, batch_item_ids)
-        base_loss = base_loss + 0.1 * info_loss
+        base_loss = base_loss + self.lambda2 * info_loss
 
         return base_loss
 
@@ -183,6 +195,8 @@ def build_backbone_model(backbone_name, dataset, args, device):
     target = model.base_model if hasattr(model, 'base_model') else model
     if hasattr(target, 'set_precomputed_adj'):
         target.set_precomputed_adj(dataset.get_adj_matrices())
+    if hasattr(target, 'set_train_interactions'):
+        target.set_train_interactions(dataset.train_data, dataset.n_users, dataset.n_items)
 
     return model.to(device)
 
@@ -235,7 +249,8 @@ def run_single_config(backbone_name, use_intra, use_inter,
                 base_model, modality_dims, args.embed_dim,
                 use_intra=use_intra, use_inter=use_inter,
                 n_protos=args.n_protos, eps=args.eps, p=args.p_norm,
-                lam=args.lam, tau=args.tau
+                lam=args.lam, tau=args.tau,
+                lambda1=args.lambda1, lambda2=args.lambda2
             ).to(device)
         else:
             model = base_model

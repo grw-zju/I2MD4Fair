@@ -5,7 +5,8 @@ import numpy as np
 
 
 def recall_(pos_index, pos_len):
-    rec_ret = np.cumsum(pos_index, axis=1) / pos_len.reshape(-1, 1)
+    safe_len = np.where(pos_len == 0, 1, pos_len)
+    rec_ret = np.cumsum(pos_index, axis=1) / safe_len.reshape(-1, 1)
     return rec_ret.mean(axis=0)
 
 
@@ -17,7 +18,10 @@ def ndcg_(pos_index, pos_len):
     iranks[:, :] = np.arange(1, pos_index.shape[1] + 1)
     idcg = np.cumsum(1.0 / np.log2(iranks + 1), axis=1)
     for row, idx in enumerate(idcg_len):
-        idcg[row, idx:] = idcg[row, idx - 1]
+        if idx == 0:
+            idcg[row, :] = 1e-20
+        else:
+            idcg[row, idx:] = idcg[row, idx - 1]
 
     ranks = np.zeros_like(pos_index, dtype=np.float64)
     ranks[:, :] = np.arange(1, pos_index.shape[1] + 1)
@@ -31,11 +35,15 @@ def ndcg_(pos_index, pos_len):
 def cal_gini(num_list):
     if len(num_list) <= 1:
         return 0.0
-    cum_degree = np.cumsum(sorted(np.append(num_list, 0)))
+    sorted_list = sorted(num_list)
+    n = len(sorted_list)
+    if n <= 1:
+        return 0.0
+    cum_degree = np.cumsum(sorted_list)
     sum_degree = cum_degree[-1]
     if sum_degree == 0:
         return 0.0
-    xarray = np.array(range(0, len(cum_degree))) / (len(cum_degree) - 1)
+    xarray = np.array(range(0, n)) / (n - 1)
     yarray = cum_degree / sum_degree
     b_area = np.trapz(yarray, x=xarray)
     a_area = 0.5 - b_area

@@ -54,13 +54,14 @@ class ModalityDebiasingWrapper(nn.Module):
         return features[:, :self.embed_dim] if features.shape[1] >= self.embed_dim else F.pad(features, (0, self.embed_dim - features.shape[1]))
 
     def compute_loss(self, user_ids, pos_ids, neg_ids, graph_norm, modality_features):
-        if hasattr(self.base_model, 'compute_loss') and graph_norm is not None:
-            try:
-                return self.base_model.compute_loss(user_ids, pos_ids, neg_ids, graph_norm, modality_features)
-            except TypeError:
-                return self.base_model.compute_loss(user_ids, pos_ids, neg_ids, modality_features)
+        import inspect
+        sig = inspect.signature(self.base_model.compute_loss)
+        n_params = len(sig.parameters)
+        if n_params >= 5:
+            return self.base_model.compute_loss(user_ids, pos_ids, neg_ids, graph_norm, modality_features)
         else:
-            return self.base_model.compute_loss(user_ids, pos_ids, neg_ids, graph_norm)
+            return self.base_model.compute_loss(user_ids, pos_ids, neg_ids, modality_features) if n_params == 4 \
+                else self.base_model.compute_loss(user_ids, pos_ids, neg_ids, graph_norm)
 
     def get_embs(self, graph_norm, modality_features):
         return self.forward(graph_norm, modality_features)
@@ -94,7 +95,7 @@ class ModalityDebiasingWrapper(nn.Module):
             weight = self._user_item_rank_weight(
                 user_embs[user_ids], self._match_item_dim(modality_items[k], user_embs.shape[1]), rank_weights[k]
             )
-            debiased = debiased + scores * joint_gate - weight * score_star * joint_gate
+            debiased = debiased - weight * score_star * joint_gate
         return debiased
 
     def prepare_full_sort(self, dataset, device):

@@ -63,6 +63,7 @@ class DMRL(nn.Module):
 
     def _split_factors(self, emb):
         chunk_size = self.embed_dim // self.num_factors
+        assert self.embed_dim % self.num_factors == 0, "embed_dim must be divisible by num_factors"
         return list(emb.split(chunk_size, dim=-1))
 
     def _compute_scores(self, user_ids, item_ids, modality_embs):

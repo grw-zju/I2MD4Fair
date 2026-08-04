@@ -38,7 +38,7 @@ class LATTICE(nn.Module):
         rows = torch.arange(n).unsqueeze(1).expand(-1, k).flatten()
         cols = topk_indices.flatten()
         values = torch.ones(rows.shape[0], device=features.device)
-        adj = torch.sparse.FloatTensor(
+        adj = torch.sparse_coo_tensor(
             torch.stack([rows, cols]), values, (n, n)
         ).to_dense()
         adj = adj + adj.T

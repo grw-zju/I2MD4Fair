@@ -57,12 +57,14 @@ def run_stats(args):
         print(f"{metric:<15} {t_stat:>10.4f} {p_value:>12.6f} {mean_diff:>12.4f} "
               f"{diff.std(ddof=1):>10.4f} {ci_low:>10.4f} {ci_high:>10.4f} {effect_size:>12.4f}")
 
-    sorted_p = sorted(p_values.values())
-    n_tests = len(sorted_p)
+    sorted_metrics = sorted(metrics, key=lambda m: p_values[m])
+    n_tests = len(sorted_metrics)
     print(f"\nHolm-adjusted p-values:")
-    for metric in metrics:
-        rank = sorted_p.index(p_values[metric]) + 1
+    prev_adjusted = 0.0
+    for rank, metric in enumerate(sorted_metrics, 1):
         adjusted = min(p_values[metric] * (n_tests - rank + 1), 1.0)
+        adjusted = max(adjusted, prev_adjusted)
+        prev_adjusted = adjusted
         print(f"  {metric}: raw={p_values[metric]:.6f}, adjusted={adjusted:.6f}")
 
 
