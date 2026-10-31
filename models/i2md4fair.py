@@ -1,0 +1,514 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class SinkhornOT(nn.Module):
+    def __init__(self, eps=0.1, n_iters=3):
+        super().__init__()
+        self.eps = eps
+        self.n_iters = n_iters
+
+    def forward(self, cost_matrix):
+        K = torch.exp(-cost_matrix / self.eps).clamp_min(1e-12)
+        n_items, n_protos = K.shape
+        a = torch.ones(n_items, device=K.device) / n_items
+        b = torch.ones(n_protos, device=K.device) / n_protos
+        for _ in range(self.n_iters):
+            a = 1.0 / (n_items * (K @ b).clamp_min(1e-12))
+            b = 1.0 / (n_protos * (K.T @ a).clamp_min(1e-12))
+        gamma = a.unsqueeze(1) * K * b.unsqueeze(0)
+        return gamma
+
+
+class SoftPrototypeClustering(nn.Module):
+    def __init__(self, n_items, n_protos, embed_dim, eps=0.1):
+        super().__init__()
+        prototypes = torch.empty(n_protos, embed_dim)
+        nn.init.xavier_uniform_(prototypes)
+        self.prototypes = nn.Parameter(prototypes)
+        self.ot_solver = SinkhornOT(eps=eps, n_iters=3)
+
+    def forward(self, Z_v):
+        Z_norm = F.normalize(Z_v, dim=1)
+        P_norm = F.normalize(self.prototypes, dim=1)
+        cost = 1 - Z_norm @ P_norm.T
+        gamma = self.ot_solver(cost)
+        return gamma
+
+
+class HypergraphConv(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.W = nn.Parameter(torch.empty(embed_dim, embed_dim))
+        nn.init.xavier_uniform_(self.W)
+
+    def forward(self, Z_v, incidence_matrix):
+        H = incidence_matrix
+        D_v = H.sum(dim=1).clamp_min(1e-8)
+        D_e = H.sum(dim=0).clamp_min(1e-8)
+        Z_tmp = Z_v * torch.pow(D_v, -0.5).unsqueeze(1)
+        Z_tmp = H.T @ Z_tmp
+        Z_tmp = Z_tmp * torch.pow(D_e, -1).unsqueeze(1)
+        Z_tmp = H @ Z_tmp
+        Z_tmp = Z_tmp * torch.pow(D_v, -0.5).unsqueeze(1)
+        Z_out = Z_tmp @ self.W
+        return F.relu(Z_out)
+
+
+class PairwiseGCN(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.W = nn.Parameter(torch.empty(embed_dim, embed_dim))
+        nn.init.xavier_uniform_(self.W)
+
+    def forward(self, Z_v, incidence_matrix):
+        H = incidence_matrix
+        A = H @ H.T
+        D = A.sum(dim=1).clamp_min(1e-8)
+        D_inv_sqrt = torch.pow(D, -0.5)
+        A_norm = D_inv_sqrt.unsqueeze(1) * A * D_inv_sqrt.unsqueeze(0)
+        Z_out = A_norm @ Z_v @ self.W
+        return F.relu(Z_out)
+
+
+class IntraMDM(nn.Module):
+    def __init__(self, n_items, n_protos, embed_dim, eps=0.1):
+        super().__init__()
+        self.n_items = n_items
+        self.soft_clustering = SoftPrototypeClustering(n_items, n_protos, embed_dim, eps)
+        self.hgcn = HypergraphConv(embed_dim)
+
+    def forward(self, Z_v):
+        gamma = self.soft_clustering(Z_v)
+        B_I = Z_v.shape[0]
+        incidence = B_I * gamma
+        Z_v_debiased = self.hgcn(Z_v, incidence)
+        return Z_v_debiased, gamma
+
+
+class CLUBEstimator(nn.Module):
+    def __init__(self, x_dim, z_dim, hidden_dim=64, chunk_size=512):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.net = nn.Sequential(
+            nn.Linear(x_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, z_dim * 2),
+        )
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        params = self.net(x)
+        mu, logvar = params.chunk(2, dim=-1)
+        logvar = torch.clamp(logvar, -10, 10)
+        return mu, logvar
+
+    def log_prob(self, z, mu, logvar):
+        return -0.5 * (logvar + (z - mu) ** 2 / (torch.exp(logvar) + 1e-8))
+
+    def mi_upper_bound(self, x, z):
+        B = z.shape[0]
+        if B < 2:
+            return torch.tensor(0.0, device=z.device)
+        with torch.no_grad():
+            mu, logvar = self.forward(x)
+        log_pos = self.log_prob(z, mu, logvar).sum(dim=-1)
+
+        log_neg_sum = torch.tensor(0.0, device=z.device)
+        for s in range(0, B, self.chunk_size):
+            e = min(s + self.chunk_size, B)
+            z_chunk = z[s:e]
+            lp = self.log_prob(
+                z_chunk.unsqueeze(0),
+                mu.unsqueeze(1),
+                logvar.unsqueeze(1)
+            ).sum(dim=-1)
+
+            mask = torch.ones(B, e - s, device=z.device)
+            for r in range(e - s):
+                global_j = s + r
+                if global_j < B:
+                    mask[global_j, r] = 0.0
+            log_neg_sum = log_neg_sum + (lp * mask).sum()
+
+        mi_est = log_pos.mean() - log_neg_sum / (B * (B - 1))
+        return torch.clamp(mi_est, min=0)
+
+    def nll_loss(self, x, z):
+        mu, logvar = self.forward(x)
+        nll = -self.log_prob(z, mu, logvar).sum(dim=-1).mean()
+        return nll
+
+
+class InterMDM(nn.Module):
+    def __init__(self, modality_dims, embed_dim, p=2, lam=0.01, chunk_size=512):
+        super().__init__()
+        self.p = p
+        self.lam = lam
+        self.club_estimators = nn.ModuleDict()
+        for k, dim in modality_dims.items():
+            self.club_estimators[k] = CLUBEstimator(dim, embed_dim, chunk_size=chunk_size)
+
+    def compute_mi(self, modality_inputs, Z_v_debiased_dict):
+        mi_terms = {}
+        for k in modality_inputs:
+            mi_terms[k] = self.club_estimators[k].mi_upper_bound(
+                modality_inputs[k], Z_v_debiased_dict[k]
+            )
+        return mi_terms
+
+    def adaptive_loss(self, per_modality_losses):
+        loss_values = torch.stack([l for l in per_modality_losses.values()]).clamp_min(1e-12)
+        p_norm = torch.pow(torch.sum(torch.pow(loss_values, self.p)), 1.0 / self.p)
+        return p_norm
+
+    def club_nll(self, modality_inputs, Z_v_debiased_dict):
+        total_nll = torch.tensor(0.0, device=modality_inputs[list(modality_inputs.keys())[0]].device)
+        for k in modality_inputs:
+            total_nll = total_nll + self.club_estimators[k].nll_loss(
+                modality_inputs[k], Z_v_debiased_dict[k]
+            )
+        return total_nll
+
+
+class InfoNCELoss(nn.Module):
+    def __init__(self, tau=0.01, chunk_size=512):
+        super().__init__()
+        self.tau = tau
+        self.chunk_size = chunk_size
+
+    def forward(self, modality_embs, item_ids=None):
+        modality_keys = list(modality_embs.keys())
+        M = len(modality_keys)
+        if M < 2:
+            return torch.tensor(0.0, device=modality_embs[modality_keys[0]].device)
+        total_loss = torch.tensor(0.0, device=modality_embs[modality_keys[0]].device)
+        n_pairs = 0
+        for i in range(M):
+            for j in range(M):
+                if i == j:
+                    continue
+                k1, k2 = modality_keys[i], modality_keys[j]
+                z1_raw = modality_embs[k1] if item_ids is None else modality_embs[k1][item_ids]
+                z2_raw = modality_embs[k2] if item_ids is None else modality_embs[k2][item_ids]
+                z1 = F.normalize(z1_raw, dim=1)
+                z2 = F.normalize(z2_raw, dim=1)
+                B = z1.shape[0]
+                pair_loss = torch.tensor(0.0, device=z1.device)
+                for s in range(0, B, self.chunk_size):
+                    e = min(s + self.chunk_size, B)
+                    sim_chunk = z1[s:e] @ z2.T / self.tau
+                    labels = torch.arange(s, e, device=sim_chunk.device)
+                    pair_loss = pair_loss + F.cross_entropy(
+                        sim_chunk, labels, reduction='sum')
+                pair_loss = pair_loss / B
+                total_loss = total_loss + pair_loss
+                n_pairs += 1
+        return total_loss / max(n_pairs, 1)
+
+
+class I2MD4Fair(nn.Module):
+    def __init__(self, n_users, n_items, embed_dim, modality_dims,
+                 n_protos=64, eps=0.1, p=2, lam=0.01, tau=0.01,
+                 n_layers=2, n_modality_layers=1,
+                 lambda1=0.1, lambda2=0.1, lambda3=1e-4,
+                 chunk_size=512):
+        super().__init__()
+        self.n_users = n_users
+        self.n_items = n_items
+        self.embed_dim = embed_dim
+        self.n_layers = n_layers
+        self.n_modality_layers = n_modality_layers
+        self.lambda1 = lambda1
+        self.lambda2 = lambda2
+        self.lambda3 = lambda3
+        self.lam = lam
+        self.chunk_size = chunk_size
+
+        self.user_id_emb = nn.Embedding(n_users, embed_dim)
+        self.item_id_emb = nn.Embedding(n_items, embed_dim)
+        nn.init.xavier_uniform_(self.user_id_emb.weight)
+        nn.init.xavier_uniform_(self.item_id_emb.weight)
+
+        self.intra_mdm = nn.ModuleDict()
+        for k in modality_dims:
+            self.intra_mdm[k] = IntraMDM(n_items, n_protos, embed_dim, eps)
+
+        self.inter_mdm = InterMDM(modality_dims, embed_dim, p=p, lam=lam, chunk_size=chunk_size)
+
+        self.info_nce = InfoNCELoss(tau=tau, chunk_size=chunk_size)
+
+        self.modality_item_encoders = nn.ModuleDict()
+        for k, dim in modality_dims.items():
+            encoder = nn.Sequential(
+                nn.Linear(dim, embed_dim),
+                nn.ReLU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+            for m in encoder:
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+            self.modality_item_encoders[k] = encoder
+
+    def _id_message_passing(self, graph_norm):
+        all_embs = torch.cat([self.user_id_emb.weight, self.item_id_emb.weight], dim=0)
+        embs_list = [all_embs]
+        for _ in range(self.n_layers):
+            all_embs = torch.sparse.mm(graph_norm, all_embs) if graph_norm.is_sparse else graph_norm @ all_embs
+            embs_list.append(all_embs)
+        final = torch.mean(torch.stack(embs_list, dim=1), dim=1)
+        return final[:self.n_users], final[self.n_users:]
+
+    def _modality_init_propagation(self, inter_norm_u, inter_norm_v, E_I_init):
+        E_I = E_I_init
+        embs_list = [E_I]
+        for _ in range(self.n_modality_layers):
+            if inter_norm_u.is_sparse:
+                E_U = torch.sparse.mm(inter_norm_u, E_I)
+            else:
+                E_U = inter_norm_u @ E_I
+            if inter_norm_v.is_sparse:
+                E_I = torch.sparse.mm(inter_norm_v, E_U)
+            else:
+                E_I = inter_norm_v @ E_U
+            embs_list.append(E_I)
+        return torch.mean(torch.stack(embs_list, dim=1), dim=1)
+
+    def _reconstruct_modality_user(self, inter_norm_u, Z_I_debiased):
+        if inter_norm_u.is_sparse:
+            Z_U = torch.sparse.mm(inter_norm_u, Z_I_debiased)
+        else:
+            Z_U = inter_norm_u @ Z_I_debiased
+        return Z_U
+
+    def _build_context_users(self, context_ids, all_item_ids, Z_I_debiased_batch):
+        """Build modality-aware user representations from context items (Eq. 18).
+
+        Z̃_{B,U}^m = (D_B^ctx)^{-1} R_B^ctx Z̃_{B,I}^m
+        where D_{bb}^ctx = max(1, |C_b|) and R_B^ctx is the context-interaction matrix.
+        An empty context yields a zero user vector.
+        """
+        B, C_max = context_ids.shape
+        d = Z_I_debiased_batch.shape[1]
+        B_I = all_item_ids.shape[0]
+        device = Z_I_debiased_batch.device
+
+        valid_mask = context_ids >= 0  # [B, C_max]
+        context_clamped = context_ids.clamp_min(0)  # [B, C_max]
+        context_local = torch.searchsorted(all_item_ids, context_clamped.reshape(-1)).reshape(B, C_max)
+
+        valid_flat = valid_mask.reshape(-1)
+        col_flat = context_local.reshape(-1)
+        row_flat = torch.arange(B, device=device).unsqueeze(1).expand(B, C_max).reshape(-1)
+
+        valid_idx = valid_flat
+        row_idx = row_flat[valid_idx]
+        col_idx = col_flat[valid_idx]
+        vals = torch.ones(len(row_idx), dtype=torch.float, device=device)
+
+        R_B_ctx = torch.sparse_coo_tensor(
+            torch.stack([row_idx, col_idx]), vals, (B, B_I)
+        ).coalesce()
+
+        deg = torch.sparse.sum(R_B_ctx, dim=1).to_dense().clamp_min(1.0).unsqueeze(1)  # [B, 1]
+        Z_U = torch.sparse.mm(R_B_ctx, Z_I_debiased_batch) / deg  # [B, d]
+        return Z_U
+
+    def forward(self, graph_norm, modality_features, user_ids, item_pos_ids, item_neg_ids,
+                interaction_matrix_norm_u=None, interaction_matrix_norm_v=None,
+                warmup=False, Z_I_full_dict=None, context_ids=None,
+                all_item_ids=None, rank_item_ids=None):
+        X_U_final, X_V_final = self._id_message_passing(graph_norm)
+
+        if rank_item_ids is None:
+            rank_item_ids = torch.unique(torch.cat([item_pos_ids, item_neg_ids]))
+
+        if all_item_ids is None:
+            if context_ids is not None:
+                valid_context = context_ids[context_ids >= 0]
+                all_item_ids = torch.unique(torch.cat([rank_item_ids, valid_context]))
+            else:
+                all_item_ids = rank_item_ids
+
+        item_pos_local = torch.searchsorted(all_item_ids, item_pos_ids)
+        item_neg_local = torch.searchsorted(all_item_ids, item_neg_ids)
+        rank_item_local = torch.searchsorted(all_item_ids, rank_item_ids)
+
+        if Z_I_full_dict is None:
+            Z_I_full_dict = self._compute_modality_reprs(
+                modality_features, interaction_matrix_norm_u, interaction_matrix_norm_v,
+                detach=False)
+
+        Z_I_debiased_dict = {}
+        Z_U_dict = {}
+        modality_inputs = {}
+
+        for k in modality_features:
+            Z_I_k_batch = Z_I_full_dict[k][all_item_ids]
+            Z_I_k_debiased_batch, gamma_k = self.intra_mdm[k](Z_I_k_batch)
+
+            if context_ids is not None:
+                Z_U_k = self._build_context_users(
+                    context_ids, all_item_ids, Z_I_k_debiased_batch)
+            else:
+                Z_U_k = Z_I_k_debiased_batch[item_pos_local]
+
+            Z_I_debiased_dict[k] = Z_I_k_debiased_batch
+            Z_U_dict[k] = Z_U_k
+            modality_inputs[k] = modality_features[k][rank_item_ids]
+
+        rank_debiased_dict = {k: Z_I_debiased_dict[k][rank_item_local] for k in Z_I_debiased_dict}
+
+        mi_terms = self.inter_mdm.compute_mi(modality_inputs, rank_debiased_dict)
+
+        info_nce_loss = self.info_nce(rank_debiased_dict)
+
+        hat_X_U_batch = X_U_final[user_ids]
+        hat_X_V_batch_pos = X_V_final[item_pos_ids]
+        hat_X_V_batch_neg = X_V_final[item_neg_ids]
+        for k in Z_U_dict:
+            hat_X_U_batch = torch.cat([hat_X_U_batch, Z_U_dict[k]], dim=1)
+            hat_X_V_batch_pos = torch.cat([hat_X_V_batch_pos, Z_I_debiased_dict[k][item_pos_local]], dim=1)
+            hat_X_V_batch_neg = torch.cat([hat_X_V_batch_neg, Z_I_debiased_dict[k][item_neg_local]], dim=1)
+
+        u_emb = hat_X_U_batch
+        pos_emb = hat_X_V_batch_pos
+        neg_emb = hat_X_V_batch_neg
+
+        pos_scores = (u_emb * pos_emb).sum(dim=1)
+        neg_scores = (u_emb * neg_emb).sum(dim=1)
+
+        bpr_loss = -F.logsigmoid(pos_scores - neg_scores).mean()
+
+        per_modality_losses = {}
+        for k in modality_features:
+            u_emb_k = Z_U_dict[k]
+            pos_emb_k = Z_I_debiased_dict[k][item_pos_local]
+            neg_emb_k = Z_I_debiased_dict[k][item_neg_local]
+            pos_scores_k = (u_emb_k * pos_emb_k).sum(dim=1)
+            neg_scores_k = (u_emb_k * neg_emb_k).sum(dim=1)
+            rec_loss_k = -F.logsigmoid(pos_scores_k - neg_scores_k).mean()
+            if warmup:
+                total_loss_k = rec_loss_k
+            else:
+                total_loss_k = rec_loss_k + self.lam * mi_terms[k]
+            per_modality_losses[k] = total_loss_k
+
+        adaptive_loss = self.inter_mdm.adaptive_loss(per_modality_losses)
+
+        reg_loss = self._l2_reg()
+        total_loss = bpr_loss + self.lambda1 * adaptive_loss + self.lambda2 * info_nce_loss + self.lambda3 * reg_loss
+
+        return total_loss, bpr_loss, adaptive_loss, info_nce_loss
+
+    def _l2_reg(self):
+        club_params = set()
+        for k in self.inter_mdm.club_estimators:
+            for p in self.inter_mdm.club_estimators[k].parameters():
+                club_params.add(p)
+        reg = 0.0
+        for param in self.parameters():
+            if param not in club_params:
+                reg = reg + param.pow(2).sum()
+        return reg
+
+    def _compute_modality_reprs(self, modality_features,
+                                interaction_matrix_norm_u=None,
+                                interaction_matrix_norm_v=None,
+                                item_ids=None, detach=False):
+        if detach:
+            with torch.no_grad():
+                return self._compute_modality_reprs_inner(
+                    modality_features, interaction_matrix_norm_u, interaction_matrix_norm_v)
+        return self._compute_modality_reprs_inner(
+            modality_features, interaction_matrix_norm_u, interaction_matrix_norm_v)
+
+    def _compute_modality_reprs_inner(self, modality_features,
+                                       interaction_matrix_norm_u=None,
+                                       interaction_matrix_norm_v=None):
+        Z_I_full_dict = {}
+        for k in modality_features:
+            M_k = modality_features[k]
+            E_I_k = self.modality_item_encoders[k](M_k)
+            if interaction_matrix_norm_u is not None and interaction_matrix_norm_v is not None:
+                Z_I_k = self._modality_init_propagation(
+                    interaction_matrix_norm_u, interaction_matrix_norm_v, E_I_k)
+            else:
+                Z_I_k = E_I_k
+            Z_I_full_dict[k] = Z_I_k
+        return Z_I_full_dict
+
+    def _intra_mdm_batch(self, Z_I_full_dict, item_ids):
+        Z_I_debiased_dict = {}
+        for k in Z_I_full_dict:
+            Z_I_k_batch = Z_I_full_dict[k][item_ids]
+            Z_I_k_debiased, _ = self.intra_mdm[k](Z_I_k_batch)
+            Z_I_debiased_dict[k] = Z_I_k_debiased
+        return Z_I_debiased_dict
+
+    def club_nll_loss(self, modality_features, graph_norm=None,
+                      interaction_matrix_norm_u=None, interaction_matrix_norm_v=None,
+                      all_item_ids=None, rank_item_ids=None, Z_I_full_dict=None):
+        if rank_item_ids is None:
+            rank_item_ids = all_item_ids
+        if all_item_ids is None:
+            all_item_ids = rank_item_ids
+        if Z_I_full_dict is None:
+            Z_I_full_dict = self._compute_modality_reprs(
+                modality_features, interaction_matrix_norm_u, interaction_matrix_norm_v,
+                detach=True)
+        with torch.no_grad():
+            Z_I_debiased_dict = {}
+            modality_inputs = {}
+            for k in modality_features:
+                M_k = modality_features[k]
+                Z_I_k_batch = Z_I_full_dict[k][all_item_ids]
+                Z_I_k_debiased, _ = self.intra_mdm[k](Z_I_k_batch)
+                rank_local = torch.searchsorted(all_item_ids, rank_item_ids)
+                Z_I_debiased_dict[k] = Z_I_k_debiased[rank_local].detach()
+                modality_inputs[k] = M_k[rank_item_ids]
+        return self.inter_mdm.club_nll(modality_inputs, Z_I_debiased_dict)
+
+    def get_user_item_embs(self, graph_norm, modality_features,
+                           interaction_matrix_norm_u=None, interaction_matrix_norm_v=None):
+        X_U_final, X_V_final = self._id_message_passing(graph_norm)
+
+        Z_I_debiased_dict = {}
+        Z_U_dict = {}
+        Z_I_dict = {}
+
+        for k in modality_features:
+            M_k = modality_features[k]
+            E_I_k = self.modality_item_encoders[k](M_k)
+
+            if interaction_matrix_norm_u is not None and interaction_matrix_norm_v is not None:
+                Z_I_k = self._modality_init_propagation(
+                    interaction_matrix_norm_u, interaction_matrix_norm_v, E_I_k
+                )
+            else:
+                Z_I_k = E_I_k
+
+            Z_I_k_debiased, _ = self.intra_mdm[k](Z_I_k)
+            Z_I_debiased_dict[k] = Z_I_k_debiased
+
+            if interaction_matrix_norm_u is not None and interaction_matrix_norm_v is not None:
+                Z_U_k = self._reconstruct_modality_user(interaction_matrix_norm_u, Z_I_k_debiased)
+            else:
+                Z_U_k = X_U_final
+            Z_U_dict[k] = Z_U_k
+            Z_I_dict[k] = Z_I_k_debiased
+
+        hat_X_U = X_U_final
+        hat_X_V = X_V_final
+        for k in Z_U_dict:
+            hat_X_U = torch.cat([hat_X_U, Z_U_dict[k]], dim=1)
+            hat_X_V = torch.cat([hat_X_V, Z_I_dict[k]], dim=1)
+
+        return hat_X_U, hat_X_V
